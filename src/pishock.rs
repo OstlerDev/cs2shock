@@ -21,6 +21,9 @@ const USER_DEVICES_ENDPOINT: &str = "https://ps.pishock.com/PiShock/GetUserDevic
 const BROKER_ENDPOINT: &str = "wss://broker.pishock.com/v2";
 const BROKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(4);
 const BROKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const BROKER_RECONNECT_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const BROKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(5000);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_millis(10000);
 const INVALID_BROKER_AUTH_MESSAGE: &str =
@@ -195,6 +198,8 @@ async fn run_broker_owner(mut receiver: mpsc::Receiver<BrokerRequest>) {
     let mut state = BrokerOwnerState::default();
     let mut heartbeat = tokio::time::interval(BROKER_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut reconnect = tokio::time::interval(BROKER_RECONNECT_TICK_INTERVAL);
+    reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -217,6 +222,11 @@ async fn run_broker_owner(mut receiver: mpsc::Receiver<BrokerRequest>) {
             _ = heartbeat.tick(), if state.socket.is_some() => {
                 if let Err(e) = heartbeat_broker(&mut state).await {
                     warn!(target: "PiShock API", "PiShock broker heartbeat failed: {}", e);
+                }
+            }
+            _ = reconnect.tick(), if should_reconnect_broker(&state) => {
+                if let Err(e) = reconnect_broker(&mut state).await {
+                    warn!(target: "PiShock API", "PiShock broker reconnect failed: {}", e);
                 }
             }
         }
@@ -255,7 +265,7 @@ async fn handle_publish_request(
         publish_over_socket(socket, &channel, &body).await
     };
     if result.is_err() {
-        clear_broker_socket(state);
+        mark_broker_socket_failed(state);
     }
     result
 }
@@ -269,7 +279,7 @@ async fn heartbeat_broker(state: &mut BrokerOwnerState) -> Result<(), String> {
         send_broker_ping(socket).await
     };
     if result.is_err() {
-        clear_broker_socket(state);
+        mark_broker_socket_failed(state);
     }
     result
 }
@@ -279,6 +289,7 @@ fn sync_session_config(state: &mut BrokerOwnerState, config: &Config) {
     if state.auth_key.as_ref() != Some(&auth_key) {
         state.auth_key = Some(auth_key);
         clear_broker_socket(state);
+        clear_broker_reconnect_backoff(state);
         state.cached_target = None;
         return;
     }
@@ -319,10 +330,24 @@ async fn ensure_socket_connected(state: &mut BrokerOwnerState) -> Result<(), Str
         .auth_key
         .clone()
         .ok_or_else(|| "PiShock broker auth was unavailable.".to_string())?;
-    let mut socket = connect_broker_socket(&auth_key).await?;
-    send_broker_ping(&mut socket).await?;
-    state.socket = Some(socket);
-    Ok(())
+    let result = async {
+        let mut socket = connect_broker_socket(&auth_key).await?;
+        send_broker_ping(&mut socket).await?;
+        Ok::<BrokerSocket, String>(socket)
+    }
+    .await;
+
+    match result {
+        Ok(socket) => {
+            state.socket = Some(socket);
+            clear_broker_reconnect_backoff(state);
+            Ok(())
+        }
+        Err(error) => {
+            schedule_broker_reconnect(state);
+            Err(error)
+        }
+    }
 }
 
 fn validate_broker_auth(config: &Config) -> Result<(), String> {
@@ -878,6 +903,8 @@ struct BrokerOwnerState {
     auth_key: Option<BrokerAuthKey>,
     socket: Option<BrokerSocket>,
     cached_target: Option<CachedTarget>,
+    reconnect_failures: u32,
+    next_reconnect_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1072,15 +1099,57 @@ fn clear_broker_socket(state: &mut BrokerOwnerState) {
     clear_last_successful_heartbeat();
 }
 
+fn mark_broker_socket_failed(state: &mut BrokerOwnerState) {
+    clear_broker_socket(state);
+    schedule_broker_reconnect(state);
+}
+
+async fn reconnect_broker(state: &mut BrokerOwnerState) -> Result<(), String> {
+    if state.socket.is_some() {
+        clear_broker_reconnect_backoff(state);
+        return Ok(());
+    }
+
+    ensure_socket_connected(state).await
+}
+
+fn should_reconnect_broker(state: &BrokerOwnerState) -> bool {
+    state.socket.is_none()
+        && state.auth_key.is_some()
+        && state
+            .next_reconnect_at
+            .is_some_and(|next_reconnect_at| Instant::now() >= next_reconnect_at)
+}
+
+fn schedule_broker_reconnect(state: &mut BrokerOwnerState) {
+    state.reconnect_failures = state.reconnect_failures.saturating_add(1);
+    let delay = broker_reconnect_delay(state.reconnect_failures);
+    state.next_reconnect_at = Some(Instant::now() + delay);
+}
+
+fn clear_broker_reconnect_backoff(state: &mut BrokerOwnerState) {
+    state.reconnect_failures = 0;
+    state.next_reconnect_at = None;
+}
+
+fn broker_reconnect_delay(reconnect_failures: u32) -> Duration {
+    let exponent = reconnect_failures.saturating_sub(1).min(4);
+    BROKER_RECONNECT_BASE_DELAY
+        .saturating_mul(1u32 << exponent)
+        .min(BROKER_RECONNECT_MAX_DELAY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        broker_error_message, build_broker_body, build_broker_connect_url,
-        clear_last_successful_heartbeat, discovered_targets_from_devices, is_pong_response,
-        is_publish_success, last_heartbeat_elapsed, parse_broker_response, publish_target,
-        record_successful_heartbeat_at, sync_session_config, validate_broker_auth,
-        validate_control_config, BrokerAuthKey, BrokerMetadata, BrokerOwnerState, BrokerResponse,
-        OwnedDevice, PiShockOp, ResolvedTarget, INVALID_BROKER_AUTH_MESSAGE,
+        broker_error_message, broker_reconnect_delay, build_broker_body, build_broker_connect_url,
+        clear_broker_reconnect_backoff, clear_last_successful_heartbeat,
+        discovered_targets_from_devices, is_pong_response, is_publish_success,
+        last_heartbeat_elapsed, parse_broker_response, publish_target,
+        record_successful_heartbeat_at, should_reconnect_broker, sync_session_config,
+        validate_broker_auth, validate_control_config, BrokerAuthKey, BrokerMetadata,
+        BrokerOwnerState, BrokerResponse, OwnedDevice, PiShockOp, ResolvedTarget,
+        INVALID_BROKER_AUTH_MESSAGE,
     };
     use crate::config::Config;
     use std::{
@@ -1248,6 +1317,45 @@ mod tests {
     }
 
     #[test]
+    fn broker_reconnect_delay_backs_off_and_caps() {
+        assert_eq!(broker_reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(broker_reconnect_delay(2), Duration::from_secs(4));
+        assert_eq!(broker_reconnect_delay(3), Duration::from_secs(8));
+        assert_eq!(broker_reconnect_delay(4), Duration::from_secs(16));
+        assert_eq!(broker_reconnect_delay(5), Duration::from_secs(30));
+        assert_eq!(broker_reconnect_delay(6), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn clear_broker_reconnect_backoff_resets_retry_state() {
+        let mut state = BrokerOwnerState::default();
+        state.reconnect_failures = 3;
+        state.next_reconnect_at = Some(Instant::now() + Duration::from_secs(8));
+
+        clear_broker_reconnect_backoff(&mut state);
+
+        assert_eq!(state.reconnect_failures, 0);
+        assert_eq!(state.next_reconnect_at, None);
+    }
+
+    #[test]
+    fn should_reconnect_broker_requires_due_retry() {
+        let mut state = BrokerOwnerState::default();
+        state.auth_key = Some(BrokerAuthKey {
+            username: "user".into(),
+            apikey: "key".into(),
+        });
+
+        assert!(!should_reconnect_broker(&state));
+
+        state.next_reconnect_at = Some(Instant::now() + Duration::from_secs(1));
+        assert!(!should_reconnect_broker(&state));
+
+        state.next_reconnect_at = Some(Instant::now() - Duration::from_secs(1));
+        assert!(should_reconnect_broker(&state));
+    }
+
+    #[test]
     fn sync_session_config_clears_cached_target_when_selected_shocker_changes() {
         let mut state = BrokerOwnerState::default();
         let mut config = Config::default();
@@ -1295,6 +1403,8 @@ mod tests {
             username: "old-user".into(),
             apikey: "old-key".into(),
         });
+        state.reconnect_failures = 2;
+        state.next_reconnect_at = Some(Instant::now() + Duration::from_secs(4));
 
         let mut config = Config::default();
         config.username = "new-user".into();
@@ -1302,6 +1412,8 @@ mod tests {
 
         sync_session_config(&mut state, &config);
         assert_eq!(last_heartbeat_elapsed(), None);
+        assert_eq!(state.reconnect_failures, 0);
+        assert_eq!(state.next_reconnect_at, None);
     }
 
     #[test]
