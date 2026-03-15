@@ -3,6 +3,7 @@ mod config;
 mod gamestateintegration;
 mod gui;
 mod pishock;
+mod pishock_session_controller;
 
 use std::{
     fs::File,
@@ -30,7 +31,11 @@ struct GameState {
     round_phase: RoundPhase,
     map_phase: MapPhase,
     steam_id: String,
+    player_team: Option<String>,
     player_state: Option<PlayerState>,
+    triggered_this_round: bool,
+    shocks_disabled_until_next_round: bool,
+    pending_round_loss_shock: Option<PendingShock>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,13 +46,23 @@ struct PlayerState {
     deaths: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingShock {
+    intensity: i32,
+    duration_ms: u64,
+}
+
 impl Default for GameState {
     fn default() -> Self {
         Self {
             round_phase: RoundPhase::Unknown,
             map_phase: MapPhase::Unknown,
             steam_id: String::new(),
+            player_team: None,
             player_state: None,
+            triggered_this_round: false,
+            shocks_disabled_until_next_round: false,
+            pending_round_loss_shock: None,
         }
     }
 }
@@ -56,7 +71,11 @@ impl GameState {
     fn reset(&mut self) {
         self.round_phase = RoundPhase::Unknown;
         self.map_phase = MapPhase::Unknown;
+        self.player_team = None;
         self.player_state = None;
+        self.triggered_this_round = false;
+        self.shocks_disabled_until_next_round = false;
+        self.pending_round_loss_shock = None;
     }
 }
 
@@ -72,7 +91,7 @@ async fn main() {
         .expect("Failed to initialize logger");
 
     let config = || -> Result<Config, Error> {
-        let mut file = File::open("config.json")?;
+        let mut file = File::open("cs2shock-config.json")?;
         let mut raw = String::new();
         file.read_to_string(&mut raw)?;
         let conf = serde_json::from_str::<Config>(&raw)?;

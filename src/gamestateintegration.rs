@@ -20,6 +20,7 @@ pub enum MapPhase {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Round {
     pub phase: RoundPhase,
+    pub win_team: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,7 @@ pub struct PlayerMatchStats {
 pub struct Player {
     pub steamid: String,
     pub name: String,
+    pub team: Option<String>,
     pub state: PlayerState,
     pub match_stats: PlayerMatchStats,
 }
