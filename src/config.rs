@@ -3,6 +3,7 @@ use std::{fs::OpenOptions, io::Write};
 use log::error;
 use serde::{Deserialize, Serialize};
 
+pub const CONFIG_FILE_PATH: &str = "cs2shock-config.json";
 pub const MIN_SHOCK_DURATION: f32 = 0.1;
 pub const MAX_SHOCK_DURATION: f32 = 5.0;
 const SHOCK_DURATION_STEP: f32 = 0.1;
@@ -37,6 +38,7 @@ pub struct Config {
     pub selected_device_name: String,
     pub selected_shocker_name: String,
     pub apikey: String,
+    pub setup_dismissed: bool,
 }
 
 impl Default for Config {
@@ -61,6 +63,7 @@ impl Default for Config {
             selected_device_name: String::new(),
             selected_shocker_name: String::new(),
             apikey: String::new(),
+            setup_dismissed: false,
         }
     }
 }
@@ -166,6 +169,7 @@ mod tests {
         assert!(config.shock_on_round_loss_only);
         assert!(config.prevent_shock_if_round_kills_reached);
         assert_eq!(config.round_kills_to_prevent_shock, 1);
+        assert!(!config.setup_dismissed);
     }
 
     #[test]
@@ -210,6 +214,18 @@ mod tests {
         let config: Config = serde_json::from_value(json).unwrap();
 
         assert_eq!(config.shock_chance, 35);
+    }
+
+    #[test]
+    fn deserialize_missing_setup_dismissed_defaults_to_false() {
+        let json = serde_json::json!({
+            "username": "player",
+            "apikey": "key"
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert!(!config.setup_dismissed);
     }
 
     #[test]

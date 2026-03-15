@@ -13,10 +13,7 @@
 - Optional beep on round start
 - `Random` shock mode using configured min/max values
 - `LastHitPercentage` mode that scales the shock based on the HP you had before death
-- Automatic PiShock broker warmup on startup and after auth changes
-- Automatic shocker refresh when saved credentials are available or auth editing finishes
-- Automatic config saving
-- `PiShock API` heartbeat status that shows when the broker websocket last responded
+- Built-in first-run onboarding with CS2 integration install help
 
 ## PiShock Integration
 
@@ -39,18 +36,18 @@ This matches the documented PiShock V2 websocket flow in the [PiShock WebSocket 
 
 ## Setup
 
-1. Open your Counter-Strike 2 install directory in Steam with `Manage > Browse local files`.
-2. Copy `gamestate_integration_cs2shock.cfg` into `game/csgo/cfg`.
-3. Launch `cs2shock.exe` or run the project from source.
+1. Launch `cs2shock.exe` or run the project from source.
+2. Follow the in-app `Finish setup` prompt.
+3. Let the app install `gamestate_integration_cs2shock.cfg` automatically, or use the in-app manual steps if you prefer to copy it into `game/csgo/cfg` yourself.
 4. Enter your PiShock username and API key.
 5. Choose one of your owned PiShock shockers from the picker.
-6. Click `Test beep` once to confirm its live.
+6. Click `Test beep` once to confirm it's live.
 
 The app starts a local listener on `http://127.0.0.1:3000/data`, which is what the Game State Integration config points to.
 
 ## Configuration
 
-The app automatically saves the config to `cs2shock-config.json`
+The app automatically saves the config to `cs2shock-config.json` in the current working directory. In normal packaged use, that is alongside the executable.
 
 Current config fields:
 
@@ -73,6 +70,7 @@ Current config fields:
 - `selected_device_name`: the selected PiShock device name
 - `selected_shocker_name`: the selected PiShock shocker name
 - `apikey`: your PiShock API key
+- `setup_dismissed`: whether the first-run setup modal was dismissed before setup completed
 
 Default values on a fresh config:
 
@@ -161,7 +159,7 @@ If beeps work but shocks do not:
 - Make sure you refreshed the owned shocker list and selected the correct PiShock shocker
 - Make sure the device is online and not paused in PiShock
 - Verify that your username and API key are correct
-- Watch the `PiShock API` heartbeat label. If it stays at `not connected yet` or shows a connection error, re-focus and leave either auth field or click `Refresh shockers` to retry broker warmup and device discovery.
+- Watch the `PiShock API` heartbeat label. The app will retry broker reconnects automatically after heartbeat/socket failures, but you can still re-focus and leave either auth field or click `Refresh shockers` to force a fresh broker warmup and device discovery.
 - If you use `LastHitPercentage`, remember that dying at very low HP can produce a very small shock
 - If `shock_chance` is below `100`, some otherwise eligible deaths are expected to end without a shock
 - If you win the round, post-round deaths should not trigger a shock before the next round starts
@@ -183,5 +181,5 @@ If the app does not react to gameplay:
 - In round-loss-only mode, a stored death is resolved when the round winner is known
 - The round-kill suppression rule is checked when the death event is detected
 - `shock_chance` is applied after the optional warning beep and before the final shock is sent
-- The project stores configuration in local `config.json`
+- The project stores configuration in local `cs2shock-config.json`
 - PiShock intensity and duration limits are enforced before sending requests

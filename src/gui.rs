@@ -10,9 +10,10 @@ use log::{debug, error, info};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{Config, ShockMode, MAX_SHOCK_DURATION, MIN_SHOCK_DURATION},
+    config::{Config, ShockMode, CONFIG_FILE_PATH, MAX_SHOCK_DURATION, MIN_SHOCK_DURATION},
     pishock,
     pishock_session_controller::{PishockSessionController, SessionAsyncResult},
+    setup::{self, Cs2IntegrationStatus, SetupStep, SetupSummary},
 };
 
 const AUTO_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -50,6 +51,11 @@ pub async fn run(config: Arc<RwLock<Config>>) {
 struct MyApp {
     config: Arc<RwLock<Config>>,
     changes: Config,
+    cs2_integration_status: Cs2IntegrationStatus,
+    show_setup_manual_steps: bool,
+    setup_install_action_status: Option<String>,
+    setup_section_revision: u64,
+    last_setup_step: SetupStep,
     revealed_auth_field: Option<AuthField>,
     async_result_tx: mpsc::Sender<SessionAsyncResult>,
     async_result_rx: mpsc::Receiver<SessionAsyncResult>,
@@ -199,6 +205,14 @@ fn selected_target_label(config: &Config) -> String {
     }
 }
 
+fn setup_section_title(label: &str, is_complete: bool) -> String {
+    if is_complete {
+        format!("{label} (done)")
+    } else {
+        format!("{label} (needed)")
+    }
+}
+
 impl MyApp {
     fn new(
         config: Arc<RwLock<Config>>,
@@ -206,12 +220,20 @@ impl MyApp {
         async_result_tx: mpsc::Sender<SessionAsyncResult>,
         async_result_rx: mpsc::Receiver<SessionAsyncResult>,
     ) -> Self {
+        let cs2_integration_status = setup::detect_cs2_integration();
+        let initial_setup_step =
+            SetupSummary::from_config(&changes, cs2_integration_status.clone()).current_step();
         let mut session_controller = PishockSessionController::new(&changes);
         session_controller.sync_startup(&async_result_tx, &changes);
 
         Self {
             config,
             changes,
+            cs2_integration_status,
+            show_setup_manual_steps: false,
+            setup_install_action_status: None,
+            setup_section_revision: 0,
+            last_setup_step: initial_setup_step,
             revealed_auth_field: None,
             async_result_tx,
             async_result_rx,
@@ -231,10 +253,403 @@ impl MyApp {
 
         if let Ok(mut owned_config) = self.config.clone().try_write() {
             *owned_config = self.changes.clone();
-            match owned_config.try_write_to_file("cs2shock-config.json") {
+            match owned_config.try_write_to_file(CONFIG_FILE_PATH) {
                 Ok(()) => debug!(target: "GUI", "Auto-saved config"),
                 Err(err) => error!(target: "GUI", "Failed to auto-save config: {}", err),
             }
+        }
+    }
+
+    fn refresh_cs2_integration_status(&mut self) {
+        self.cs2_integration_status = setup::detect_cs2_integration();
+    }
+
+    fn setup_summary(&self) -> SetupSummary {
+        SetupSummary::from_config(&self.changes, self.cs2_integration_status.clone())
+    }
+
+    fn should_show_setup_modal(&self) -> bool {
+        self.setup_summary().needs_setup() && !self.changes.setup_dismissed
+    }
+
+    fn dismiss_setup(&mut self) {
+        if !self.changes.setup_dismissed {
+            self.changes.setup_dismissed = true;
+            self.auto_save.request_immediate_save();
+        }
+        self.show_setup_manual_steps = false;
+        self.setup_install_action_status = None;
+    }
+
+    fn reopen_setup(&mut self) {
+        self.show_setup_manual_steps = false;
+        self.setup_install_action_status = None;
+        if self.changes.setup_dismissed {
+            self.changes.setup_dismissed = false;
+            self.auto_save.request_immediate_save();
+        }
+        self.refresh_cs2_integration_status();
+    }
+
+    fn reset_setup_dismissal_if_complete(&mut self) {
+        if self.setup_summary().is_complete() && self.changes.setup_dismissed {
+            self.changes.setup_dismissed = false;
+            self.auto_save.request_immediate_save();
+        }
+    }
+
+    fn sync_setup_section_revision(&mut self) {
+        let current_step = self.setup_summary().current_step();
+        if current_step != self.last_setup_step {
+            self.last_setup_step = current_step;
+            self.setup_section_revision = self.setup_section_revision.wrapping_add(1);
+        }
+    }
+
+    fn render_auth_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        username_id_source: &'static str,
+        api_key_id_source: &'static str,
+    ) {
+        let username_response = text_row(
+            ui,
+            "Username: ",
+            &mut self.changes.username,
+            ui.make_persistent_id(username_id_source),
+        );
+        let api_key_response = secret_text_row(
+            ui,
+            "API key: ",
+            &mut self.changes.apikey,
+            ui.make_persistent_id(api_key_id_source),
+            AuthField::ApiKey,
+            &mut self.revealed_auth_field,
+        );
+
+        if username_response.lost_focus() || api_key_response.lost_focus() {
+            self.session_controller
+                .refresh_after_auth_commit(&self.async_result_tx, &mut self.changes);
+            self.auto_save.request_immediate_save();
+        }
+    }
+
+    fn refresh_shockers(&mut self) {
+        info!(target: "GUI", "Loading PiShock shockers");
+        self.session_controller
+            .refresh_manually(&self.async_result_tx, &self.changes);
+    }
+
+    fn send_test_beep(&self) {
+        info!(target: "GUI", "Sending test beep");
+        let config = Arc::new(RwLock::new(self.changes.clone()));
+        tokio::spawn(async move {
+            pishock::beep(config, 1).await;
+        });
+    }
+
+    fn open_cs2_cfg_folder(&mut self, target_path: &std::path::Path) {
+        self.setup_install_action_status = Some(match setup::open_cs2_cfg_folder(target_path) {
+            Ok(()) => format!("Opened `{}`.", target_path.parent().unwrap().display()),
+            Err(message) => message,
+        });
+    }
+
+    fn save_cs2_integration_to_downloads(&mut self) {
+        self.setup_install_action_status = Some(match setup::save_cs2_integration_to_downloads() {
+            Ok(download_path) => format!("Saved `{}`.", download_path.display()),
+            Err(message) => message,
+        });
+    }
+
+    fn render_refresh_and_test_buttons(&mut self, ui: &mut egui::Ui, refresh_label: &str) {
+        let discovery_button = if self.session_controller.discovery_in_progress() {
+            Button::new("Loading shockers...")
+        } else {
+            Button::new(refresh_label)
+        };
+
+        if ui
+            .add_enabled(
+                !self.session_controller.discovery_in_progress(),
+                discovery_button,
+            )
+            .clicked()
+        {
+            self.refresh_shockers();
+        }
+
+        if ui
+            .add_enabled(has_selected_target(&self.changes), Button::new("Test beep"))
+            .clicked()
+        {
+            self.send_test_beep();
+        }
+    }
+
+    fn render_shocker_picker(&mut self, ui: &mut egui::Ui, combo_id_source: &'static str) {
+        if !self.session_controller.discovered_targets().is_empty() {
+            let mut chosen_target = None;
+
+            ui.horizontal(|ui| {
+                ui.horizontal(|ui| {
+                    ui.set_width(85.0);
+                    ui.label("Shocker: ");
+                });
+
+                ComboBox::from_id_source(combo_id_source)
+                    .selected_text(selected_target_label(&self.changes))
+                    .show_ui(ui, |ui| {
+                        for target in self.session_controller.discovered_targets() {
+                            let is_selected = Some(target.client_id)
+                                == self.changes.selected_client_id
+                                && Some(target.shocker_id) == self.changes.selected_shocker_id;
+
+                            if ui
+                                .selectable_label(is_selected, discovered_target_label(target))
+                                .clicked()
+                            {
+                                chosen_target = Some(target.clone());
+                            }
+                        }
+                    });
+            });
+
+            if let Some(target) = chosen_target {
+                apply_selected_target(&mut self.changes, &target);
+                self.session_controller
+                    .set_target_status(format!("Selected {}.", discovered_target_label(&target)));
+                self.auto_save.request_immediate_save();
+            }
+        } else if has_selected_target(&self.changes) {
+            ui.label(format!(
+                "Saved shocker: {}",
+                selected_target_label(&self.changes)
+            ));
+        }
+    }
+
+    fn render_status_labels(&self, ui: &mut egui::Ui) {
+        if should_require_selected_target(&self.changes) && !has_selected_target(&self.changes) {
+            ui.label("Select the shocker you want to use.");
+        }
+
+        if let Some(status) = self.session_controller.target_status() {
+            ui.label(status);
+        }
+
+        ui.label(self.session_controller.broker_status_label());
+    }
+
+    fn render_setup_banner(&mut self, ui: &mut egui::Ui, summary: &SetupSummary) {
+        ui.group(|ui| {
+            ui.label(
+                "Finish setup to install the CS2 integration and connect your PiShock shocker.",
+            );
+            ui.label(match summary.current_step() {
+                SetupStep::InstallCs2Integration => "Next step: install the CS2 integration file.",
+                SetupStep::ConnectPishock => "Next step: enter your PiShock username and API key.",
+                SetupStep::ChooseShocker => "Next step: pick which PiShock shocker to use.",
+                SetupStep::Complete => "Setup is complete.",
+            });
+            if ui.button("Finish setup").clicked() {
+                self.reopen_setup();
+            }
+        });
+    }
+
+    fn render_setup_install_section(&mut self, ui: &mut egui::Ui, summary: &SetupSummary) {
+        egui::CollapsingHeader::new(setup_section_title(
+            "1. Install CS2 integration",
+            summary.cs2_integration.is_installed(),
+        ))
+        .id_source(("setup_install_section", self.setup_section_revision))
+        .default_open(summary.current_step() == SetupStep::InstallCs2Integration)
+        .show(ui, |ui| {
+            ui.label("CS2 needs one small file so the game can send live events to CS2Shock.");
+
+            match &summary.cs2_integration {
+                Cs2IntegrationStatus::Installed { .. } => {
+                    ui.label("The CS2 integration file is installed and points to this app.");
+                    if ui.button("Re-check installation").clicked() {
+                        self.refresh_cs2_integration_status();
+                    }
+                }
+                Cs2IntegrationStatus::MissingKnownPath { target_path }
+                | Cs2IntegrationStatus::RepairRecommended { target_path, .. } => {
+                    if let Some(message) = summary.cs2_integration.message() {
+                        ui.label(message);
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(summary.cs2_integration.install_action_label())
+                            .clicked()
+                        {
+                            match setup::install_cs2_integration(target_path) {
+                                Ok(()) => self.refresh_cs2_integration_status(),
+                                Err(message) => {
+                                    self.cs2_integration_status =
+                                        Cs2IntegrationStatus::CheckFailed {
+                                            target_path: Some(target_path.clone()),
+                                            message,
+                                        };
+                                }
+                            }
+                        }
+
+                        if ui.button("Manual instructions").clicked() {
+                            self.show_setup_manual_steps = !self.show_setup_manual_steps;
+                        }
+
+                        if ui.button("Do this later").clicked() {
+                            self.dismiss_setup();
+                        }
+                    });
+                }
+                Cs2IntegrationStatus::MissingUnknownPath
+                | Cs2IntegrationStatus::CheckFailed { .. } => {
+                    if let Some(message) = summary.cs2_integration.message() {
+                        ui.label(message);
+                    } else {
+                        ui.label("CS2 was not found automatically on this computer.");
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Retry detection").clicked() {
+                            self.refresh_cs2_integration_status();
+                        }
+
+                        if ui.button("Manual instructions").clicked() {
+                            self.show_setup_manual_steps = !self.show_setup_manual_steps;
+                        }
+
+                        if ui.button("Do this later").clicked() {
+                            self.dismiss_setup();
+                        }
+                    });
+                }
+            }
+
+            if self.show_setup_manual_steps {
+                ui.separator();
+                ui.label("Manual install:");
+                ui.label(
+                    "1. In your Steam Library, select Counter-Strike 2, click on the Settings button and choose 'Properties', then click Installed Files > Browse.",
+                );
+                ui.label("2. Open the `game/csgo/cfg` folder.");
+                ui.label("3. Copy `gamestate_integration_cs2shock.cfg` into that folder.");
+                ui.label("4. If you want a manual copy, save the file to Downloads and drag it into the cfg folder.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            summary.cs2_integration.target_path().is_some(),
+                            Button::new("Open Folder"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(target_path) = summary.cs2_integration.target_path() {
+                            self.open_cs2_cfg_folder(target_path);
+                        }
+                    }
+
+                    if ui.button("Save Integration File").clicked() {
+                        self.save_cs2_integration_to_downloads();
+                    }
+
+                    if ui.button("Re-check installation").clicked() {
+                        self.refresh_cs2_integration_status();
+                    }
+                });
+
+                if let Some(status) = self.setup_install_action_status.as_deref() {
+                    ui.label(status);
+                }
+            }
+        });
+    }
+
+    fn render_setup_connect_section(&mut self, ui: &mut egui::Ui, summary: &SetupSummary) {
+        egui::CollapsingHeader::new(setup_section_title(
+            "2. Connect PiShock",
+            summary.has_auth_credentials,
+        ))
+        .id_source(("setup_connect_section", self.setup_section_revision))
+        .default_open(summary.current_step() == SetupStep::ConnectPishock)
+        .show(ui, |ui| {
+            ui.label("Enter your PiShock username and API key.");
+            self.render_auth_fields(ui, "setup_username_field", "setup_api_key_field");
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to(
+                    "Create PiShock API Key",
+                    "https://login.pishock.com/account",
+                );
+            });
+        });
+    }
+
+    fn render_setup_shocker_section(&mut self, ui: &mut egui::Ui, summary: &SetupSummary) {
+        egui::CollapsingHeader::new(setup_section_title(
+            "3. Choose a shocker",
+            summary.has_selected_target,
+        ))
+        .id_source(("setup_shocker_section", self.setup_section_revision))
+        .default_open(summary.current_step() == SetupStep::ChooseShocker)
+        .show(ui, |ui| {
+            if !summary.has_auth_credentials {
+                ui.label("Finish the PiShock login step first, then load your shockers.");
+                return;
+            }
+            
+            self.render_status_labels(ui);
+
+            self.render_shocker_picker(ui, "setup_shocker_picker");
+            ui.horizontal(|ui| self.render_refresh_and_test_buttons(ui, "Refresh shockers"));
+
+            let can_finish = self.setup_summary().is_complete();
+            if can_finish {
+                ui.label("You are ready to play.");
+            }
+
+            if ui
+                .add_enabled(can_finish, Button::new("Finish setup"))
+                .clicked()
+            {
+                self.show_setup_manual_steps = false;
+                if self.changes.setup_dismissed {
+                    self.changes.setup_dismissed = false;
+                    self.auto_save.request_immediate_save();
+                }
+            }
+        });
+    }
+
+    fn render_setup_modal(&mut self, ctx: &egui::Context) {
+        let summary = self.setup_summary();
+        let mut open = true;
+
+        egui::Window::new("Finish setup")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("CS2Shock needs a couple of quick setup steps before it will work.");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(430.0)
+                    .show(ui, |ui| {
+                        self.render_setup_install_section(ui, &summary);
+                        ui.separator();
+                        self.render_setup_connect_section(ui, &summary);
+                        ui.separator();
+                        self.render_setup_shocker_section(ui, &summary);
+                    });
+            });
+
+        if !open {
+            self.dismiss_setup();
         }
     }
 }
@@ -251,117 +666,27 @@ impl eframe::App for MyApp {
             ctx.request_repaint();
         }
 
+        self.reset_setup_dismissal_if_complete();
+        self.sync_setup_section_revision();
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            let setup_summary = self.setup_summary();
             ui.heading("CS2 Shock");
 
-            let username_response = text_row(
-                ui,
-                "Username: ",
-                &mut self.changes.username,
-                ui.make_persistent_id("username_field"),
-            );
-            let api_key_response = secret_text_row(
-                ui,
-                "API key: ",
-                &mut self.changes.apikey,
-                ui.make_persistent_id("api_key_field"),
-                AuthField::ApiKey,
-                &mut self.revealed_auth_field,
-            );
-
-            if username_response.lost_focus() || api_key_response.lost_focus() {
-                self.session_controller
-                    .refresh_after_auth_commit(&self.async_result_tx, &mut self.changes);
-                self.auto_save.request_immediate_save();
+            if setup_summary.needs_setup() && self.changes.setup_dismissed {
+                self.render_setup_banner(ui, &setup_summary);
+                ui.separator();
             }
+
+            self.render_auth_fields(ui, "username_field", "api_key_field");
 
             ui.vertical_centered_justified(|ui| {
                 ui.separator();
-                ui.horizontal(|ui| {
-                    let discovery_button = if self.session_controller.discovery_in_progress() {
-                        Button::new("Loading shockers...")
-                    } else {
-                        Button::new("Refresh shockers")
-                    };
-
-                    if ui
-                        .add_enabled(
-                            !self.session_controller.discovery_in_progress(),
-                            discovery_button,
-                        )
-                        .clicked()
-                    {
-                        info!(target: "GUI", "Loading PiShock shockers");
-                        self.session_controller
-                            .refresh_manually(&self.async_result_tx, &self.changes);
-                    }
-
-                    let has_target = has_selected_target(&self.changes);
-                    if ui
-                        .add_enabled(has_target, Button::new("Test beep"))
-                        .clicked()
-                    {
-                        info!(target: "GUI", "Sending test beep");
-                        let config = Arc::new(RwLock::new(self.changes.clone()));
-                        tokio::spawn(async move {
-                            pishock::beep(config, 1).await;
-                        });
-                    }
-                });
+                ui.horizontal(|ui| self.render_refresh_and_test_buttons(ui, "Refresh shockers"));
             });
 
-            if !self.session_controller.discovered_targets().is_empty() {
-                let mut chosen_target = None;
-
-                ui.horizontal(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_width(85.0);
-                        ui.label("Shocker: ");
-                    });
-
-                    ComboBox::from_id_source("pishock_target_picker")
-                        .selected_text(selected_target_label(&self.changes))
-                        .show_ui(ui, |ui| {
-                            for target in self.session_controller.discovered_targets() {
-                                let is_selected = Some(target.client_id)
-                                    == self.changes.selected_client_id
-                                    && Some(target.shocker_id) == self.changes.selected_shocker_id;
-
-                                if ui
-                                    .selectable_label(is_selected, discovered_target_label(target))
-                                    .clicked()
-                                {
-                                    chosen_target = Some(target.clone());
-                                }
-                            }
-                        });
-                });
-
-                if let Some(target) = chosen_target {
-                    apply_selected_target(&mut self.changes, &target);
-                    self.session_controller.set_target_status(format!(
-                        "Selected {}.",
-                        discovered_target_label(&target)
-                    ));
-                    self.auto_save.request_immediate_save();
-                }
-            } else if has_selected_target(&self.changes) {
-                ui.label(format!(
-                    "Saved shocker: {}",
-                    selected_target_label(&self.changes)
-                ));
-            }
-
-            if should_require_selected_target(&self.changes) && !has_selected_target(&self.changes)
-            {
-                ui.label("Select a PiShock shocker before sending commands.");
-            }
-
-            if let Some(status) = self.session_controller.target_status() {
-                ui.label(status);
-            }
-
-            ui.label(self.session_controller.broker_status_label());
+            self.render_shocker_picker(ui, "pishock_target_picker");
+            self.render_status_labels(ui);
 
             ui.vertical_centered(|ui| {
                 ui.separator();
@@ -369,7 +694,7 @@ impl eframe::App for MyApp {
             });
             ui.vertical_centered_justified(|ui| {
                 let random =
-                    ui.selectable_value(&mut self.changes.shock_mode, ShockMode::Random, "Random");
+                    ui.selectable_value(&mut self.changes.shock_mode, ShockMode::Random, "Random Intensity");
                 let last_hit = ui.selectable_value(
                     &mut self.changes.shock_mode,
                     ShockMode::LastHitPercentage,
@@ -381,8 +706,101 @@ impl eframe::App for MyApp {
             });
             ui.vertical_centered(|ui| ui.separator());
 
+            
+            let beep_on_match_start = ui.add(egui::Checkbox::new(
+                &mut self.changes.beep_on_match_start,
+                "Beep on match start",
+            ));
+            if beep_on_match_start.changed() {
+                self.auto_save.request_immediate_save();
+            }
+
+            let beep_on_round_start = ui.add(egui::Checkbox::new(
+                &mut self.changes.beep_on_round_start,
+                "Beep on round start",
+            ));
+            if beep_on_round_start.changed() {
+                self.auto_save.request_immediate_save();
+            }
+            ui.vertical_centered(|ui| {
+                ui.separator();
+            });
+
+            let prevent_shock_if_round_kills_reached = ui.add(egui::Checkbox::new(
+                &mut self.changes.prevent_shock_if_round_kills_reached,
+                "Prevent shock if round kills reached",
+            ));
+            if prevent_shock_if_round_kills_reached.changed() {
+                self.auto_save.request_immediate_save();
+            }
+
             ui.horizontal(|ui| {
-                let indensity_label = ui.label("Intensity: ");
+                let round_kill_label = ui.label("Kill threshold: ");
+                let round_kills = ui.add_enabled(
+                    self.changes.prevent_shock_if_round_kills_reached,
+                    DragValue::new(&mut self.changes.round_kills_to_prevent_shock)
+                        .speed(1)
+                        .clamp_range(1..=5)
+                        .suffix(" kills"),
+                );
+                let round_kills_changed = round_kills.changed();
+                round_kills.labelled_by(round_kill_label.id);
+                if round_kills_changed {
+                    self.auto_save.request_debounced_save();
+                }
+            });
+
+            let shock_on_round_loss_only = ui.add(egui::Checkbox::new(
+                &mut self.changes.shock_on_round_loss_only,
+                "Only shock if team loses round",
+            ));
+            if shock_on_round_loss_only.changed() {
+                self.auto_save.request_immediate_save();
+            }
+            ui.vertical_centered(|ui| {
+                ui.separator();
+            });
+
+            let warning_beep_before_shock = ui.add(egui::Checkbox::new(
+                &mut self.changes.warning_beep_before_shock,
+                "Play warning beep before shock",
+            ));
+            if warning_beep_before_shock.changed() {
+                self.auto_save.request_immediate_save();
+            }
+            ui.horizontal(|ui| {
+                let warning_beep_label = ui.label("Warning duration: ");
+                let warning_duration = ui.add_enabled(
+                    self.changes.warning_beep_before_shock,
+                    DragValue::new(&mut self.changes.warning_beep_duration)
+                        .speed(1)
+                        .clamp_range(1..=15)
+                        .suffix(" sec"),
+                );
+                let warning_duration_changed = warning_duration.changed();
+                warning_duration.labelled_by(warning_beep_label.id);
+                if warning_duration_changed {
+                    self.auto_save.request_debounced_save();
+                }
+            });
+            
+            ui.horizontal(|ui| {
+                let shock_chance_label = ui.label("Chance to shock: ");
+                let shock_chance = ui.add(
+                    DragValue::new(&mut self.changes.shock_chance)
+                        .speed(1)
+                        .clamp_range(0..=100)
+                        .suffix("%"),
+                );
+                let shock_chance_changed = shock_chance.changed();
+                shock_chance.labelled_by(shock_chance_label.id);
+                if shock_chance_changed {
+                    self.auto_save.request_debounced_save();
+                }
+            });
+            
+            ui.horizontal(|ui| {
+                let indensity_label = ui.label("Shock intensity: ");
 
                 let min_intensity = ui.add(
                     DragValue::new(&mut self.changes.min_intensity)
@@ -409,7 +827,7 @@ impl eframe::App for MyApp {
                 }
             });
             ui.horizontal(|ui| {
-                let duration_label = ui.label("Duration: ");
+                let duration_label = ui.label("Shock duration: ");
                 let min_duration = ui.add(
                     DragValue::new(&mut self.changes.min_duration)
                         .speed(0.1)
@@ -443,91 +861,6 @@ impl eframe::App for MyApp {
                 }
             });
 
-            let beep_on_match_start = ui.add(egui::Checkbox::new(
-                &mut self.changes.beep_on_match_start,
-                "Beep on match start",
-            ));
-            if beep_on_match_start.changed() {
-                self.auto_save.request_immediate_save();
-            }
-
-            let beep_on_round_start = ui.add(egui::Checkbox::new(
-                &mut self.changes.beep_on_round_start,
-                "Beep on round start",
-            ));
-            if beep_on_round_start.changed() {
-                self.auto_save.request_immediate_save();
-            }
-
-            let warning_beep_before_shock = ui.add(egui::Checkbox::new(
-                &mut self.changes.warning_beep_before_shock,
-                "Play warning beep",
-            ));
-            if warning_beep_before_shock.changed() {
-                self.auto_save.request_immediate_save();
-            }
-
-            let shock_on_round_loss_only = ui.add(egui::Checkbox::new(
-                &mut self.changes.shock_on_round_loss_only,
-                "Only shock if team loses round",
-            ));
-            if shock_on_round_loss_only.changed() {
-                self.auto_save.request_immediate_save();
-            }
-
-            let prevent_shock_if_round_kills_reached = ui.add(egui::Checkbox::new(
-                &mut self.changes.prevent_shock_if_round_kills_reached,
-                "Prevent shock after round kills",
-            ));
-            if prevent_shock_if_round_kills_reached.changed() {
-                self.auto_save.request_immediate_save();
-            }
-
-            ui.horizontal(|ui| {
-                let round_kill_label = ui.label("Kill threshold: ");
-                let round_kills = ui.add_enabled(
-                    self.changes.prevent_shock_if_round_kills_reached,
-                    DragValue::new(&mut self.changes.round_kills_to_prevent_shock)
-                        .speed(1)
-                        .clamp_range(1..=5)
-                        .suffix(" kills"),
-                );
-                let round_kills_changed = round_kills.changed();
-                round_kills.labelled_by(round_kill_label.id);
-                if round_kills_changed {
-                    self.auto_save.request_debounced_save();
-                }
-            });
-            ui.horizontal(|ui| {
-                let warning_beep_label = ui.label("Warning beep duration: ");
-                let warning_duration = ui.add_enabled(
-                    self.changes.warning_beep_before_shock,
-                    DragValue::new(&mut self.changes.warning_beep_duration)
-                        .speed(1)
-                        .clamp_range(1..=15)
-                        .suffix(" sec"),
-                );
-                let warning_duration_changed = warning_duration.changed();
-                warning_duration.labelled_by(warning_beep_label.id);
-                if warning_duration_changed {
-                    self.auto_save.request_debounced_save();
-                }
-            });
-            ui.horizontal(|ui| {
-                let shock_chance_label = ui.label("Chance to shock: ");
-                let shock_chance = ui.add(
-                    DragValue::new(&mut self.changes.shock_chance)
-                        .speed(1)
-                        .clamp_range(0..=100)
-                        .suffix("%"),
-                );
-                let shock_chance_changed = shock_chance.changed();
-                shock_chance.labelled_by(shock_chance_label.id);
-                if shock_chance_changed {
-                    self.auto_save.request_debounced_save();
-                }
-            });
-
             ui.vertical_centered(|ui| {
                 ui.separator();
             });
@@ -545,6 +878,10 @@ impl eframe::App for MyApp {
                 process::exit(0);
             }
         });
+
+        if self.should_show_setup_modal() {
+            self.render_setup_modal(ctx);
+        }
 
         // Keep periodic UI ticks for heartbeat freshness and debounce checks.
         ctx.request_repaint_after(Duration::from_millis(100));

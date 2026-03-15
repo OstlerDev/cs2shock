@@ -4,6 +4,7 @@ mod gamestateintegration;
 mod gui;
 mod pishock;
 mod pishock_session_controller;
+mod setup;
 
 use std::{
     fs::File,
@@ -11,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use config::Config;
+use config::{Config, CONFIG_FILE_PATH};
 use gamestateintegration::{MapPhase, RoundPhase};
 use log::{error, info};
 use simple_logger::SimpleLogger;
@@ -91,7 +92,7 @@ async fn main() {
         .expect("Failed to initialize logger");
 
     let config = || -> Result<Config, Error> {
-        let mut file = File::open("cs2shock-config.json")?;
+        let mut file = File::open(CONFIG_FILE_PATH)?;
         let mut raw = String::new();
         file.read_to_string(&mut raw)?;
         let conf = serde_json::from_str::<Config>(&raw)?;

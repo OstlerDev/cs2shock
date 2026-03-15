@@ -9,7 +9,9 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     config::{self, shock_duration_to_tenths, Config},
     gamestateintegration::{MapPhase, Payload, RoundPhase},
-    pishock, AppState, GameState, PendingShock, PlayerState,
+    pishock,
+    setup::EXPECTED_GSI_URI,
+    AppState, GameState, PendingShock, PlayerState,
 };
 
 pub async fn run(config: Arc<RwLock<Config>>) {
@@ -22,7 +24,7 @@ pub async fn run(config: Arc<RwLock<Config>>) {
         .route("/data", post(read_data))
         .with_state(state);
 
-    info!("Starting server on {}", "127.0.0.1:3000");
+    info!("Starting server on {}", EXPECTED_GSI_URI);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await

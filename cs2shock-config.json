@@ -17,5 +17,6 @@
   "selected_shocker_id": 234567,
   "selected_device_name": "yourdevicename",
   "selected_shocker_name": "yourshockername",
-  "apikey": "yourapikey"
+  "apikey": "yourapikey",
+  "setup_dismissed": false
 }

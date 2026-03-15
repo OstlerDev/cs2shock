@@ -108,13 +108,8 @@ impl PishockSessionController {
 
                         self.target_status = Some(if self.discovered_targets.is_empty() {
                             "No owned PiShock shockers were returned for this account.".into()
-                        } else if has_selected_target(config) {
-                            format!("Loaded {} PiShock shockers.", self.discovered_targets.len())
                         } else {
-                            format!(
-                                "Loaded {} PiShock shockers. Choose one before sending commands.",
-                                self.discovered_targets.len()
-                            )
+                            format!("Loaded {} PiShock shockers.", self.discovered_targets.len())
                         });
                     }
                     Err(error) => {
