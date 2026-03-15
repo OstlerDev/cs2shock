@@ -91,6 +91,9 @@ async fn main() {
         .init()
         .expect("Failed to initialize logger");
 
+    // Startup log name and version of app
+    info!("{} v{}", NAME, env!("CARGO_PKG_VERSION"));
+
     let config = || -> Result<Config, Error> {
         let mut file = File::open(CONFIG_FILE_PATH)?;
         let mut raw = String::new();
@@ -111,9 +114,8 @@ async fn main() {
         error!("Invalid config, using default");
     }
 
-    info!("Config: \n{:?}", config);
-
-    info!("{} v{}", NAME, env!("CARGO_PKG_VERSION"));
+    // Don't log the config to the console unless we are debugging! We don't want to leak the API key!
+    // info!("Config: \n{:?}", config);
 
     let c = config.clone();
 
