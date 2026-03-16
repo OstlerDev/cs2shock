@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,9 +37,9 @@ type BrokerSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub async fn shock(config: Arc<RwLock<Config>>, intensity: i32, duration_ms: u64) {
-    debug!(
+    info!(
         target: "PiShock API",
-        "Sending shock: {}, {}ms",
+        "Delivered shock with intensity: {} for {}ms",
         intensity,
         duration_ms
     );
@@ -57,9 +57,9 @@ pub async fn shock(config: Arc<RwLock<Config>>, intensity: i32, duration_ms: u64
 }
 
 pub async fn vibrate(config: Arc<RwLock<Config>>, intensity: i32, duration: i32) {
-    debug!(
+    info!(
         target: "PiShock API",
-        "Sending vibrate: {}, {}",
+        "Delivered vibrate with intensity: {} for {}ms",
         intensity,
         duration
     );
@@ -77,7 +77,7 @@ pub async fn vibrate(config: Arc<RwLock<Config>>, intensity: i32, duration: i32)
 }
 
 pub async fn beep(config: Arc<RwLock<Config>>, duration: i32) {
-    debug!(target: "PiShock API", "Sending beep: {}", duration);
+    info!(target: "PiShock API", "Delivered beep for {}ms", duration);
     if let Err(e) = post(config, PiShockOp::Beep { duration }).await {
         error!(target: "PiShock API", "Failed to send beep: {}", e);
     }
