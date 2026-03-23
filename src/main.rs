@@ -49,8 +49,7 @@ struct PlayerState {
 
 #[derive(Debug, Clone, Copy)]
 struct PendingShock {
-    intensity: i32,
-    duration_ms: u64,
+    severity: i32,
 }
 
 impl Default for GameState {

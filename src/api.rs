@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use log::{debug, info};
-use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{thread_rng, Rng};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
@@ -32,11 +32,22 @@ pub async fn run(config: Arc<RwLock<Config>>) {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn scale_last_hit_value(health_before_death: i32, max_value: i32) -> i32 {
-    let health_ratio = health_before_death.clamp(1, 100) as f32 / 100.0;
-    let scaled = (health_ratio * max_value as f32).ceil() as i32;
+fn calculate_shock_severity(config: &Config, health_before_death: i32) -> i32 {
+    match config.shock_mode {
+        config::ShockMode::Random => thread_rng().gen_range(1..=100),
+        config::ShockMode::LastHitPercentage => health_before_death.clamp(1, 100),
+    }
+}
 
-    scaled.clamp(1, max_value)
+fn scale_severity_value(severity: i32, min_value: i32, max_value: i32) -> i32 {
+    if min_value >= max_value {
+        return min_value;
+    }
+
+    let scale = (severity.clamp(1, 100) - 1) as f32 / 99.0;
+    let scaled = min_value as f32 + scale * (max_value - min_value) as f32;
+
+    scaled.round() as i32
 }
 
 fn warning_beep_delay(config: &Config) -> Option<Duration> {
@@ -123,47 +134,36 @@ fn round_outcome_for_player(player_team: Option<&str>, round_winner: Option<&str
     }
 }
 
-fn scale_last_hit_duration_ms(health_before_death: i32, max_duration: f32) -> u64 {
-    let duration_tenths =
-        scale_last_hit_value(health_before_death, shock_duration_to_tenths(max_duration));
+fn scale_severity_duration_ms(severity: i32, min_duration: f32, max_duration: f32) -> u64 {
+    let duration_tenths = scale_severity_value(
+        severity,
+        shock_duration_to_tenths(min_duration),
+        shock_duration_to_tenths(max_duration),
+    );
     duration_tenths as u64 * 100
 }
 
-fn calculate_shock_values(config: &Config, health_before_death: i32) -> (i32, u64) {
-    match config.shock_mode {
-        config::ShockMode::Random => {
-            let mut rng = StdRng::from_entropy();
-            let intensity = rng.gen_range(config.min_intensity..=config.max_intensity);
-            let duration_tenths = rng.gen_range(
-                shock_duration_to_tenths(config.min_duration)
-                    ..=shock_duration_to_tenths(config.max_duration),
-            );
-            (intensity, duration_tenths as u64 * 100)
-        }
-        config::ShockMode::LastHitPercentage => {
-            let intensity = scale_last_hit_value(health_before_death, config.max_intensity);
-            let duration = scale_last_hit_duration_ms(health_before_death, config.max_duration);
-            (intensity, duration)
-        }
-    }
+fn resolve_shock_values(config: &Config, severity: i32) -> (i32, u64) {
+    let intensity = scale_severity_value(severity, config.min_intensity, config.max_intensity);
+    let duration_ms =
+        scale_severity_duration_ms(severity, config.min_duration, config.max_duration);
+
+    (intensity, duration_ms)
 }
 
-async fn send_shock_sequence(
-    config_handle: Arc<RwLock<Config>>,
-    config: &Config,
-    intensity: i32,
-    duration_ms: u64,
-) {
-    if let Some(delay) = warning_beep_delay(config) {
+async fn send_shock_sequence(config_handle: Arc<RwLock<Config>>, severity: i32) {
+    let warning_config = config_handle.read().await.clone();
+    if let Some(delay) = warning_beep_delay(&warning_config) {
         info!(
             "Sending warning beep before shock (duration: {})",
-            config.warning_beep_duration
+            warning_config.warning_beep_duration
         );
-        pishock::beep(config_handle.clone(), config.warning_beep_duration).await;
+        pishock::beep(config_handle.clone(), warning_config.warning_beep_duration).await;
         tokio::time::sleep(delay).await;
     }
 
-    if !should_send_shock(config) {
+    let config = config_handle.read().await.clone();
+    if !should_send_shock(&config) {
         info!(
             "Skipping shock because the shock chance roll failed (shock chance: {}%)",
             config.shock_chance
@@ -171,6 +171,7 @@ async fn send_shock_sequence(
         return;
     }
 
+    let (intensity, duration_ms) = resolve_shock_values(&config, severity);
     pishock::shock(config_handle, intensity, duration_ms).await;
 }
 
@@ -283,18 +284,15 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
                                 player.state.round_kills
                             );
                         } else {
-                            let (intensity, duration) =
-                                calculate_shock_values(&config, player_state.health);
+                            let severity =
+                                calculate_shock_severity(&config, player_state.health);
 
                             if config.shock_on_round_loss_only {
                                 info!("Player died, deferring shock until round result");
-                                deferred_round_loss_shock = Some(PendingShock {
-                                    intensity,
-                                    duration_ms: duration,
-                                });
+                                deferred_round_loss_shock = Some(PendingShock { severity });
                             } else {
                                 info!("Player died, shocking");
-                                pending_shock = Some((intensity, duration));
+                                pending_shock = Some(severity);
                             }
                         }
                     }
@@ -353,7 +351,7 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
         } else if round_outcome == RoundOutcome::Lost {
             if let Some(deferred_shock) = game_state.pending_round_loss_shock.take() {
                 info!("Round lost after death, triggering deferred shock");
-                pending_shock = Some((deferred_shock.intensity, deferred_shock.duration_ms));
+                pending_shock = Some(deferred_shock.severity);
                 game_state.shocks_disabled_until_next_round = true;
             }
         } else if game_state.pending_round_loss_shock.take().is_some() {
@@ -374,8 +372,8 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
         pishock::beep(state.config.clone(), 1).await;
     }
 
-    if let Some((intensity, duration)) = pending_shock {
-        send_shock_sequence(state.config.clone(), &config, intensity, duration).await;
+    if let Some(severity) = pending_shock {
+        send_shock_sequence(state.config.clone(), severity).await;
     }
 
     StatusCode::OK
@@ -384,23 +382,28 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_shock_values, did_player_win_round, round_outcome_for_player,
-        scale_last_hit_value, should_prevent_shock_for_round_kills, should_send_shock,
-        should_send_shock_after_roll, should_trigger_death_sequence, warning_beep_delay,
-        RoundOutcome,
+        calculate_shock_severity, did_player_win_round, resolve_shock_values,
+        round_outcome_for_player, scale_severity_value, should_prevent_shock_for_round_kills,
+        should_send_shock, should_send_shock_after_roll, should_trigger_death_sequence,
+        warning_beep_delay, RoundOutcome,
     };
-    use crate::config::{Config, ShockMode};
+    use crate::{
+        config::{Config, ShockMode},
+        PendingShock,
+    };
     use crate::gamestateintegration::RoundPhase;
     use std::time::Duration;
 
     #[test]
-    fn scale_last_hit_value_rounds_up_low_non_zero_values() {
-        assert_eq!(scale_last_hit_value(1, 15), 1);
+    fn scale_severity_value_anchors_to_configured_bounds() {
+        assert_eq!(scale_severity_value(1, 20, 40), 20);
+        assert_eq!(scale_severity_value(100, 20, 40), 40);
     }
 
     #[test]
-    fn scale_last_hit_value_uses_percentage_of_maximum() {
-        assert_eq!(scale_last_hit_value(25, 83), 21);
+    fn scale_severity_value_uses_shared_percentage_across_range() {
+        assert_eq!(scale_severity_value(25, 20, 40), 25);
+        assert_eq!(scale_severity_value(50, 20, 40), 30);
     }
 
     #[test]
@@ -565,12 +568,77 @@ mod tests {
     }
 
     #[test]
-    fn calculate_shock_values_uses_last_hit_percentage_mode() {
+    fn calculate_shock_severity_uses_last_hit_percentage_mode() {
         let mut config = Config::default();
         config.shock_mode = ShockMode::LastHitPercentage;
-        config.max_intensity = 80;
+
+        assert_eq!(calculate_shock_severity(&config, 25), 25);
+        assert_eq!(calculate_shock_severity(&config, 0), 1);
+        assert_eq!(calculate_shock_severity(&config, 150), 100);
+    }
+
+    #[test]
+    fn calculate_shock_severity_random_mode_stays_in_bounds() {
+        let config = Config::default();
+
+        for _ in 0..128 {
+            let severity = calculate_shock_severity(&config, 25);
+            assert!((1..=100).contains(&severity));
+        }
+    }
+
+    #[test]
+    fn resolve_shock_values_respects_configured_bounds() {
+        let mut config = Config::default();
+        config.min_intensity = 20;
+        config.max_intensity = 40;
+        config.min_duration = 1.0;
+        config.max_duration = 1.0;
+
+        assert_eq!(resolve_shock_values(&config, 25), (25, 1000));
+        assert_eq!(resolve_shock_values(&config, 1), (20, 1000));
+        assert_eq!(resolve_shock_values(&config, 100), (40, 1000));
+    }
+
+    #[test]
+    fn resolve_shock_values_returns_constant_when_bounds_match() {
+        let mut config = Config::default();
+        config.min_intensity = 22;
+        config.max_intensity = 22;
+        config.min_duration = 0.8;
+        config.max_duration = 0.8;
+
+        assert_eq!(resolve_shock_values(&config, 1), (22, 800));
+        assert_eq!(resolve_shock_values(&config, 50), (22, 800));
+        assert_eq!(resolve_shock_values(&config, 100), (22, 800));
+    }
+
+    #[test]
+    fn random_mode_shared_severity_keeps_shock_within_bounds() {
+        let mut config = Config::default();
+        config.shock_mode = ShockMode::Random;
+        config.min_intensity = 20;
+        config.max_intensity = 40;
+        config.min_duration = 0.4;
         config.max_duration = 1.2;
 
-        assert_eq!(calculate_shock_values(&config, 25), (20, 300));
+        for _ in 0..128 {
+            let severity = calculate_shock_severity(&config, 25);
+            let (intensity, duration_ms) = resolve_shock_values(&config, severity);
+            assert!((20..=40).contains(&intensity));
+            assert!((400..=1200).contains(&duration_ms));
+        }
+    }
+
+    #[test]
+    fn pending_round_loss_shock_resolves_using_current_config_bounds() {
+        let pending_shock = PendingShock { severity: 100 };
+        let mut config = Config::default();
+        config.min_intensity = 5;
+        config.max_intensity = 10;
+        config.min_duration = 0.2;
+        config.max_duration = 0.3;
+
+        assert_eq!(resolve_shock_values(&config, pending_shock.severity), (10, 300));
     }
 }
