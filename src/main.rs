@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use config::{Config, CONFIG_FILE_PATH};
+use config::{Config, ShockTimingMode, CONFIG_FILE_PATH};
 use gamestateintegration::{MapPhase, RoundPhase};
 use log::{error, info};
 use simple_logger::SimpleLogger;
@@ -36,7 +36,7 @@ struct GameState {
     player_state: Option<PlayerState>,
     triggered_this_round: bool,
     shocks_disabled_until_next_round: bool,
-    pending_round_loss_shock: Option<PendingShock>,
+    pending_round_end_shock: Option<PendingShock>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,9 +47,10 @@ struct PlayerState {
     deaths: i32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingShock {
     severity: i32,
+    timing_mode: ShockTimingMode,
 }
 
 impl Default for GameState {
@@ -62,7 +63,7 @@ impl Default for GameState {
             player_state: None,
             triggered_this_round: false,
             shocks_disabled_until_next_round: false,
-            pending_round_loss_shock: None,
+            pending_round_end_shock: None,
         }
     }
 }
@@ -75,7 +76,7 @@ impl GameState {
         self.player_state = None;
         self.triggered_this_round = false;
         self.shocks_disabled_until_next_round = false;
-        self.pending_round_loss_shock = None;
+        self.pending_round_end_shock = None;
     }
 }
 

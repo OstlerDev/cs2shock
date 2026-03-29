@@ -36,7 +36,7 @@ The app automatically saves your settings to `cs2shock-config.json` in the curre
 - `warning_beep_before_shock`: boolean, beep before sending a shock
 - `warning_beep_duration`: warning beep duration in seconds, `1` to `15`
 - `shock_chance`: final percent chance that an otherwise eligible shock is actually sent, `0` to `100`
-- `shock_on_round_loss_only`: boolean, if enabled, a death stores a pending shock and only triggers it after round end if your team lost
+- `shock_timing_mode`: `"Immediate"`, `"EndOfRound"`, or `"EndOfRoundIfTeamLoses"`, controls whether shocks happen immediately, at round end, or only at round end after a loss
 - `prevent_shock_if_round_kills_reached`: boolean, if enabled, deaths are ignored once you have reached the configured kill threshold for the current round
 - `round_kills_to_prevent_shock`: round kill threshold, `1` to `5`
 - `username`: your PiShock username
@@ -46,6 +46,8 @@ The app automatically saves your settings to `cs2shock-config.json` in the curre
 - `selected_device_name`: the selected PiShock device name
 - `selected_shocker_name`: the selected PiShock shocker name
 - `setup_dismissed`: boolean, whether the first-run setup modal was dismissed
+
+Older config files that still use `shock_on_round_loss_only` are accepted for backward compatibility and map to the equivalent timing mode automatically.
 
 ## Official Release Builds
 

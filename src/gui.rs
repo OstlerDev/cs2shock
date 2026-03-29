@@ -10,7 +10,10 @@ use log::{debug, error, info};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{Config, ShockMode, CONFIG_FILE_PATH, MAX_SHOCK_DURATION, MIN_SHOCK_DURATION},
+    config::{
+        Config, ShockMode, ShockTimingMode, CONFIG_FILE_PATH, MAX_SHOCK_DURATION,
+        MIN_SHOCK_DURATION,
+    },
     pishock,
     pishock_session_controller::{PishockSessionController, SessionAsyncResult},
     setup::{self, Cs2IntegrationStatus, SetupStep, SetupSummary},
@@ -600,7 +603,7 @@ impl MyApp {
                 ui.label("Finish the PiShock login step first, then load your shockers.");
                 return;
             }
-            
+
             self.render_status_labels(ui);
 
             self.render_shocker_picker(ui, "setup_shocker_picker");
@@ -693,8 +696,11 @@ impl eframe::App for MyApp {
                 ui.label("Shock Mode: ");
             });
             ui.vertical_centered_justified(|ui| {
-                let random =
-                    ui.selectable_value(&mut self.changes.shock_mode, ShockMode::Random, "Random Intensity");
+                let random = ui.selectable_value(
+                    &mut self.changes.shock_mode,
+                    ShockMode::Random,
+                    "Random Intensity",
+                );
                 let last_hit = ui.selectable_value(
                     &mut self.changes.shock_mode,
                     ShockMode::LastHitPercentage,
@@ -706,7 +712,33 @@ impl eframe::App for MyApp {
             });
             ui.vertical_centered(|ui| ui.separator());
 
-            
+            ui.vertical_centered(|ui| {
+                ui.label("Shock Timing: ");
+            });
+            ui.vertical_centered_justified(|ui| {
+                let immediate = ui.selectable_value(
+                    &mut self.changes.shock_timing_mode,
+                    ShockTimingMode::Immediate,
+                    "Shock immediately on death",
+                );
+                let round_end = ui.selectable_value(
+                    &mut self.changes.shock_timing_mode,
+                    ShockTimingMode::EndOfRound,
+                    "Shock at round end",
+                );
+                let round_loss_only = ui.selectable_value(
+                    &mut self.changes.shock_timing_mode,
+                    ShockTimingMode::EndOfRoundIfTeamLoses,
+                    "Shock at round end only if team loses",
+                );
+                if immediate.changed() || round_end.changed() || round_loss_only.changed() {
+                    self.auto_save.request_immediate_save();
+                }
+            });
+            ui.vertical_centered(|ui| {
+                ui.separator();
+            });
+
             let beep_on_match_start = ui.add(egui::Checkbox::new(
                 &mut self.changes.beep_on_match_start,
                 "Beep on match start",
@@ -749,14 +781,6 @@ impl eframe::App for MyApp {
                     self.auto_save.request_debounced_save();
                 }
             });
-
-            let shock_on_round_loss_only = ui.add(egui::Checkbox::new(
-                &mut self.changes.shock_on_round_loss_only,
-                "Only shock if team loses round",
-            ));
-            if shock_on_round_loss_only.changed() {
-                self.auto_save.request_immediate_save();
-            }
             ui.vertical_centered(|ui| {
                 ui.separator();
             });
@@ -783,7 +807,7 @@ impl eframe::App for MyApp {
                     self.auto_save.request_debounced_save();
                 }
             });
-            
+
             ui.horizontal(|ui| {
                 let shock_chance_label = ui.label("Chance to shock: ");
                 let shock_chance = ui.add(
@@ -798,7 +822,7 @@ impl eframe::App for MyApp {
                     self.auto_save.request_debounced_save();
                 }
             });
-            
+
             ui.horizontal(|ui| {
                 let indensity_label = ui.label("Shock intensity: ");
 

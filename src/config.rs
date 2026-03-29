@@ -1,7 +1,7 @@
 use std::{fs::OpenOptions, io::Write};
 
 use log::error;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const CONFIG_FILE_PATH: &str = "cs2shock-config.json";
 pub const MIN_SHOCK_DURATION: f32 = 0.1;
@@ -13,6 +13,34 @@ const SHOCK_DURATION_EPSILON: f32 = 0.000_1;
 pub enum ShockMode {
     Random,
     LastHitPercentage,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShockTimingMode {
+    Immediate,
+    EndOfRound,
+    #[default]
+    EndOfRoundIfTeamLoses,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ShockTimingModeRepr {
+    Mode(ShockTimingMode),
+    Legacy(bool),
+}
+
+fn deserialize_shock_timing_mode<'de, D>(deserializer: D) -> Result<ShockTimingMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = ShockTimingModeRepr::deserialize(deserializer)?;
+
+    Ok(match value {
+        ShockTimingModeRepr::Mode(mode) => mode,
+        ShockTimingModeRepr::Legacy(true) => ShockTimingMode::EndOfRoundIfTeamLoses,
+        ShockTimingModeRepr::Legacy(false) => ShockTimingMode::Immediate,
+    })
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -29,7 +57,12 @@ pub struct Config {
     pub warning_beep_duration: i32,
     #[serde(alias = "warning_beep_shock_chance")]
     pub shock_chance: i32,
-    pub shock_on_round_loss_only: bool,
+    #[serde(
+        alias = "shock_on_round_loss_only",
+        default,
+        deserialize_with = "deserialize_shock_timing_mode"
+    )]
+    pub shock_timing_mode: ShockTimingMode,
     pub prevent_shock_if_round_kills_reached: bool,
     pub round_kills_to_prevent_shock: i32,
     pub username: String,
@@ -54,7 +87,7 @@ impl Default for Config {
             warning_beep_before_shock: true,
             warning_beep_duration: 2,
             shock_chance: 50,
-            shock_on_round_loss_only: true,
+            shock_timing_mode: ShockTimingMode::default(),
             prevent_shock_if_round_kills_reached: true,
             round_kills_to_prevent_shock: 1,
             username: String::new(),
@@ -151,7 +184,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ShockTimingMode};
 
     #[test]
     fn default_config_matches_application_defaults() {
@@ -166,7 +199,10 @@ mod tests {
         assert!(config.warning_beep_before_shock);
         assert_eq!(config.warning_beep_duration, 2);
         assert_eq!(config.shock_chance, 50);
-        assert!(config.shock_on_round_loss_only);
+        assert_eq!(
+            config.shock_timing_mode,
+            ShockTimingMode::EndOfRoundIfTeamLoses
+        );
         assert!(config.prevent_shock_if_round_kills_reached);
         assert_eq!(config.round_kills_to_prevent_shock, 1);
         assert!(!config.setup_dismissed);
@@ -226,6 +262,46 @@ mod tests {
         let config: Config = serde_json::from_value(json).unwrap();
 
         assert!(!config.setup_dismissed);
+    }
+
+    #[test]
+    fn deserialize_missing_shock_timing_mode_uses_default_mode() {
+        let json = serde_json::json!({
+            "username": "player",
+            "apikey": "key"
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            config.shock_timing_mode,
+            ShockTimingMode::EndOfRoundIfTeamLoses
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_round_loss_only_true_maps_to_end_of_round_if_team_loses() {
+        let json = serde_json::json!({
+            "shock_on_round_loss_only": true
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            config.shock_timing_mode,
+            ShockTimingMode::EndOfRoundIfTeamLoses
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_round_loss_only_false_maps_to_immediate_mode() {
+        let json = serde_json::json!({
+            "shock_on_round_loss_only": false
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert_eq!(config.shock_timing_mode, ShockTimingMode::Immediate);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rand::{thread_rng, Rng};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    config::{self, shock_duration_to_tenths, Config},
+    config::{self, shock_duration_to_tenths, Config, ShockTimingMode},
     gamestateintegration::{MapPhase, Payload, RoundPhase},
     pishock,
     setup::EXPECTED_GSI_URI,
@@ -91,6 +91,22 @@ fn should_prevent_shock_for_round_kills(config: &Config, round_kills: i32) -> bo
         && round_kills >= config.round_kills_to_prevent_shock
 }
 
+fn resolve_death_shock(
+    timing_mode: ShockTimingMode,
+    severity: i32,
+) -> (Option<PendingShock>, Option<i32>) {
+    match timing_mode {
+        ShockTimingMode::Immediate => (None, Some(severity)),
+        ShockTimingMode::EndOfRound | ShockTimingMode::EndOfRoundIfTeamLoses => (
+            Some(PendingShock {
+                severity,
+                timing_mode,
+            }),
+            None,
+        ),
+    }
+}
+
 fn normalize_team_name(team: &str) -> String {
     team.chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -151,6 +167,61 @@ fn resolve_shock_values(config: &Config, severity: i32) -> (i32, u64) {
     (intensity, duration_ms)
 }
 
+fn resolve_deferred_round_end_shock(
+    game_state: &mut GameState,
+    round_winner: Option<&str>,
+) -> Option<i32> {
+    let Some(pending_shock) = game_state.pending_round_end_shock else {
+        return None;
+    };
+    let player_team = game_state.player_team.clone();
+    let round_outcome = round_outcome_for_player(player_team.as_deref(), round_winner);
+
+    debug!(
+        "Round result available: player_team={:?}, round_winner={:?}, outcome={:?}, timing_mode={:?}",
+        player_team, round_winner, round_outcome, pending_shock.timing_mode
+    );
+
+    match (pending_shock.timing_mode, round_outcome) {
+        (_, RoundOutcome::Unknown) => None,
+        (ShockTimingMode::EndOfRoundIfTeamLoses, RoundOutcome::Won) => {
+            if !game_state.shocks_disabled_until_next_round {
+                debug!(
+                    "Suppressed shocks until next round: player_team={:?}, round_winner={:?}",
+                    player_team, round_winner
+                );
+                info!("Round won, disabling shocks until next round");
+            }
+
+            game_state.shocks_disabled_until_next_round = true;
+
+            if game_state.pending_round_end_shock.take().is_some() {
+                info!("Cancelled deferred shock because your team won the round");
+            }
+
+            None
+        }
+        (ShockTimingMode::EndOfRound | ShockTimingMode::Immediate, _)
+        | (ShockTimingMode::EndOfRoundIfTeamLoses, RoundOutcome::Lost) => {
+            if let Some(deferred_shock) = game_state.pending_round_end_shock.take() {
+                let trigger_message = match pending_shock.timing_mode {
+                    ShockTimingMode::EndOfRoundIfTeamLoses => {
+                        "Round lost after death, triggering deferred shock"
+                    }
+                    ShockTimingMode::EndOfRound | ShockTimingMode::Immediate => {
+                        "Round ended after death, triggering deferred shock"
+                    }
+                };
+                info!("{}", trigger_message);
+                game_state.shocks_disabled_until_next_round = true;
+                Some(deferred_shock.severity)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 async fn send_shock_sequence(config_handle: Arc<RwLock<Config>>, severity: i32) {
     let warning_config = config_handle.read().await.clone();
     if let Some(delay) = warning_beep_delay(&warning_config) {
@@ -178,10 +249,64 @@ async fn send_shock_sequence(config_handle: Arc<RwLock<Config>>, severity: i32) 
 async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) -> StatusCode {
     let mut game_state = state.game_state.lock().await;
     let config = state.config.read().await.clone();
+    let previous_map_phase = game_state.map_phase.clone();
     let previous_round_phase = game_state.round_phase.clone();
+    let payload_timestamp = payload.provider.as_ref().map(|provider| provider.timestamp);
+    let payload_map_phase = payload.map.as_ref().map(|map| map.phase.clone());
+    let payload_round_phase = payload.round.as_ref().map(|round| round.phase.clone());
+    let payload_round_winner = payload
+        .round
+        .as_ref()
+        .and_then(|round| round.win_team.clone());
+    let map_phase_changed = payload_map_phase
+        .as_ref()
+        .map(|phase| phase != &previous_map_phase)
+        .unwrap_or(false);
+    let round_phase_changed = payload_round_phase
+        .as_ref()
+        .map(|phase| phase != &previous_round_phase)
+        .unwrap_or(false);
     let mut should_beep_on_match_start = false;
     let mut should_beep_on_round_start = false;
     let mut pending_shock = None;
+
+    if map_phase_changed
+        || round_phase_changed
+        || payload_map_phase
+            .as_ref()
+            .map(|phase| phase == &MapPhase::GameOver)
+            .unwrap_or(false)
+        || payload_round_phase
+            .as_ref()
+            .map(|phase| phase == &RoundPhase::Over)
+            .unwrap_or(false)
+    {
+        info!(
+            "GSI transition ts={:?} map={:?}->{:?} round={:?}->{:?} win_team={:?} player_team={:?} pending_round_end_shock={} triggered_this_round={} shocks_disabled_until_next_round={}",
+            payload_timestamp,
+            previous_map_phase,
+            payload_map_phase,
+            previous_round_phase,
+            payload_round_phase,
+            payload_round_winner,
+            game_state.player_team,
+            game_state.pending_round_end_shock.is_some(),
+            game_state.triggered_this_round,
+            game_state.shocks_disabled_until_next_round,
+        );
+    }
+
+    if payload_map_phase
+        .as_ref()
+        .map(|phase| phase == &MapPhase::GameOver)
+        .unwrap_or(false)
+        || payload_round_phase
+            .as_ref()
+            .map(|phase| phase == &RoundPhase::Over)
+            .unwrap_or(false)
+    {
+        info!("GSI terminal payload: {:?}", &payload);
+    }
 
     if let Some(provider) = payload.provider {
         game_state.steam_id = provider.steamid;
@@ -203,19 +328,25 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
     }
 
     if let Some(round) = payload.round.as_ref() {
+        if let Some(severity) =
+            resolve_deferred_round_end_shock(&mut game_state, round.win_team.as_deref())
+        {
+            pending_shock = Some(severity);
+        }
+
         if game_state.round_phase != round.phase && round.phase == RoundPhase::Freezetime {
             game_state.triggered_this_round = false;
             game_state.shocks_disabled_until_next_round = false;
-            if game_state.pending_round_loss_shock.take().is_some() {
-                debug!("Cleared deferred round-loss shock at freezetime");
+            if game_state.pending_round_end_shock.take().is_some() {
+                debug!("Cleared deferred round-end shock at freezetime");
             }
         }
 
         if game_state.round_phase == RoundPhase::Freezetime && round.phase == RoundPhase::Live {
             game_state.triggered_this_round = false;
             game_state.shocks_disabled_until_next_round = false;
-            if game_state.pending_round_loss_shock.take().is_some() {
-                debug!("Cleared deferred round-loss shock at round start");
+            if game_state.pending_round_end_shock.take().is_some() {
+                debug!("Cleared deferred round-end shock at round start");
             }
 
             if config.beep_on_round_start {
@@ -243,7 +374,7 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
 
                 if let Some(player_state) = &mut game_state.player_state {
                     let mut should_mark_triggered_this_round = false;
-                    let mut deferred_round_loss_shock = None;
+                    let mut deferred_round_end_shock = None;
 
                     if player_state.health > player.state.health && player.state.health > 0 {
                         // Took damage and survived
@@ -284,14 +415,23 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
                                 player.state.round_kills
                             );
                         } else {
-                            let severity =
-                                calculate_shock_severity(&config, player_state.health);
+                            let severity = calculate_shock_severity(&config, player_state.health);
 
-                            if config.shock_on_round_loss_only {
-                                info!("Player died, deferring shock until round result");
-                                deferred_round_loss_shock = Some(PendingShock { severity });
-                            } else {
-                                info!("Player died, shocking");
+                            let (deferred_shock, immediate_shock) =
+                                resolve_death_shock(config.shock_timing_mode, severity);
+                            match config.shock_timing_mode {
+                                ShockTimingMode::Immediate => {
+                                    info!("Player died, shocking immediately");
+                                }
+                                ShockTimingMode::EndOfRound => {
+                                    info!("Player died, deferring shock until round end");
+                                }
+                                ShockTimingMode::EndOfRoundIfTeamLoses => {
+                                    info!("Player died, deferring shock until round result");
+                                }
+                            }
+                            deferred_round_end_shock = deferred_shock;
+                            if let Some(severity) = immediate_shock {
                                 pending_shock = Some(severity);
                             }
                         }
@@ -306,8 +446,8 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
                         game_state.triggered_this_round = true;
                     }
 
-                    if let Some(deferred_shock) = deferred_round_loss_shock {
-                        game_state.pending_round_loss_shock = Some(deferred_shock);
+                    if let Some(deferred_shock) = deferred_round_end_shock {
+                        game_state.pending_round_end_shock = Some(deferred_shock);
                     }
                 } else {
                     println!("Player state initialized");
@@ -320,45 +460,6 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
                     });
                 }
             }
-        }
-    }
-
-    if game_state.round_phase == RoundPhase::Over {
-        let player_team = game_state.player_team.clone();
-        let round_winner = payload
-            .round
-            .as_ref()
-            .and_then(|round| round.win_team.clone());
-        let round_outcome =
-            round_outcome_for_player(player_team.as_deref(), round_winner.as_deref());
-
-        debug!(
-            "Round over result: player_team={:?}, round_winner={:?}, outcome={:?}",
-            player_team, round_winner, round_outcome
-        );
-
-        if round_outcome == RoundOutcome::Won {
-            game_state.shocks_disabled_until_next_round = true;
-            debug!(
-                "Suppressed shocks until next round: player_team={:?}, round_winner={:?}",
-                player_team, round_winner
-            );
-            info!("Round won, disabling shocks until next round");
-
-            if game_state.pending_round_loss_shock.take().is_some() {
-                info!("Cancelled deferred shock because your team won the round");
-            }
-        } else if round_outcome == RoundOutcome::Lost {
-            if let Some(deferred_shock) = game_state.pending_round_loss_shock.take() {
-                info!("Round lost after death, triggering deferred shock");
-                pending_shock = Some(deferred_shock.severity);
-                game_state.shocks_disabled_until_next_round = true;
-            }
-        } else if game_state.pending_round_loss_shock.take().is_some() {
-            debug!(
-                "Cleared deferred shock because round outcome was unknown: player_team={:?}, round_winner={:?}",
-                player_team, round_winner
-            );
         }
     }
 
@@ -382,16 +483,17 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_shock_severity, did_player_win_round, resolve_shock_values,
-        round_outcome_for_player, scale_severity_value, should_prevent_shock_for_round_kills,
-        should_send_shock, should_send_shock_after_roll, should_trigger_death_sequence,
-        warning_beep_delay, RoundOutcome,
-    };
-    use crate::{
-        config::{Config, ShockMode},
-        PendingShock,
+        calculate_shock_severity, did_player_win_round, resolve_death_shock,
+        resolve_deferred_round_end_shock, resolve_shock_values, round_outcome_for_player,
+        scale_severity_value, should_prevent_shock_for_round_kills, should_send_shock,
+        should_send_shock_after_roll, should_trigger_death_sequence, warning_beep_delay,
+        RoundOutcome,
     };
     use crate::gamestateintegration::RoundPhase;
+    use crate::{
+        config::{Config, ShockMode, ShockTimingMode},
+        GameState, PendingShock,
+    };
     use std::time::Duration;
 
     #[test]
@@ -568,6 +670,103 @@ mod tests {
     }
 
     #[test]
+    fn resolve_death_shock_returns_immediate_shock_for_immediate_mode() {
+        let (pending_shock, immediate_shock) = resolve_death_shock(ShockTimingMode::Immediate, 42);
+
+        assert!(pending_shock.is_none());
+        assert_eq!(immediate_shock, Some(42));
+    }
+
+    #[test]
+    fn resolve_death_shock_defers_shock_for_end_of_round_modes() {
+        for timing_mode in [
+            ShockTimingMode::EndOfRound,
+            ShockTimingMode::EndOfRoundIfTeamLoses,
+        ] {
+            let (pending_shock, immediate_shock) = resolve_death_shock(timing_mode, 42);
+
+            assert_eq!(
+                pending_shock,
+                Some(PendingShock {
+                    severity: 42,
+                    timing_mode,
+                })
+            );
+            assert_eq!(immediate_shock, None);
+        }
+    }
+
+    #[test]
+    fn resolve_deferred_round_end_shock_triggers_on_known_win_for_end_of_round_mode() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("CT".into());
+        game_state.pending_round_end_shock = Some(PendingShock {
+            severity: 42,
+            timing_mode: ShockTimingMode::EndOfRound,
+        });
+
+        let severity = resolve_deferred_round_end_shock(&mut game_state, Some("CT"));
+
+        assert_eq!(severity, Some(42));
+        assert!(game_state.pending_round_end_shock.is_none());
+        assert!(game_state.shocks_disabled_until_next_round);
+    }
+
+    #[test]
+    fn resolve_deferred_round_end_shock_triggers_on_known_loss() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("T".into());
+        game_state.pending_round_end_shock = Some(PendingShock {
+            severity: 42,
+            timing_mode: ShockTimingMode::EndOfRoundIfTeamLoses,
+        });
+
+        let severity = resolve_deferred_round_end_shock(&mut game_state, Some("CT"));
+
+        assert_eq!(severity, Some(42));
+        assert!(game_state.pending_round_end_shock.is_none());
+        assert!(game_state.shocks_disabled_until_next_round);
+    }
+
+    #[test]
+    fn resolve_deferred_round_end_shock_cancels_on_known_win_for_team_loss_mode() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("CT".into());
+        game_state.pending_round_end_shock = Some(PendingShock {
+            severity: 42,
+            timing_mode: ShockTimingMode::EndOfRoundIfTeamLoses,
+        });
+
+        let severity = resolve_deferred_round_end_shock(&mut game_state, Some("CT"));
+
+        assert_eq!(severity, None);
+        assert!(game_state.pending_round_end_shock.is_none());
+        assert!(game_state.shocks_disabled_until_next_round);
+    }
+
+    #[test]
+    fn resolve_deferred_round_end_shock_keeps_pending_when_winner_unknown() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("T".into());
+        game_state.pending_round_end_shock = Some(PendingShock {
+            severity: 42,
+            timing_mode: ShockTimingMode::EndOfRound,
+        });
+
+        let severity = resolve_deferred_round_end_shock(&mut game_state, None);
+
+        assert_eq!(severity, None);
+        assert_eq!(
+            game_state
+                .pending_round_end_shock
+                .as_ref()
+                .map(|pending_shock| pending_shock.severity),
+            Some(42)
+        );
+        assert!(!game_state.shocks_disabled_until_next_round);
+    }
+
+    #[test]
     fn calculate_shock_severity_uses_last_hit_percentage_mode() {
         let mut config = Config::default();
         config.shock_mode = ShockMode::LastHitPercentage;
@@ -631,14 +830,20 @@ mod tests {
     }
 
     #[test]
-    fn pending_round_loss_shock_resolves_using_current_config_bounds() {
-        let pending_shock = PendingShock { severity: 100 };
+    fn pending_round_end_shock_resolves_using_current_config_bounds() {
+        let pending_shock = PendingShock {
+            severity: 100,
+            timing_mode: ShockTimingMode::EndOfRound,
+        };
         let mut config = Config::default();
         config.min_intensity = 5;
         config.max_intensity = 10;
         config.min_duration = 0.2;
         config.max_duration = 0.3;
 
-        assert_eq!(resolve_shock_values(&config, pending_shock.severity), (10, 300));
+        assert_eq!(
+            resolve_shock_values(&config, pending_shock.severity),
+            (10, 300)
+        );
     }
 }
