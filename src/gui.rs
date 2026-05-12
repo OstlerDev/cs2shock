@@ -11,12 +11,14 @@ use tokio::sync::RwLock;
 
 use crate::{
     config::{
-        Config, ShockMode, ShockTimingMode, CONFIG_FILE_PATH, MAX_SHOCK_DURATION,
+        Config, RoundEndRewardGating, ShockMode, ShockTimingMode, CONFIG_FILE_PATH,
+        MAX_REWARD_KILL_THRESHOLD, MAX_SHOCK_DURATION, MIN_REWARD_KILL_THRESHOLD,
         MIN_SHOCK_DURATION,
     },
     pishock,
     pishock_session_controller::{PishockSessionController, SessionAsyncResult},
     setup::{self, Cs2IntegrationStatus, SetupStep, SetupSummary},
+    sounds::{self, SoundChoice, VOLUME_PERCENT_MAX},
 };
 
 const AUTO_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -214,6 +216,48 @@ fn setup_section_title(label: &str, is_complete: bool) -> String {
     } else {
         format!("{label} (needed)")
     }
+}
+
+fn sound_picker(
+    ui: &mut egui::Ui,
+    id_source: &'static str,
+    choice: &mut SoundChoice,
+    enabled: bool,
+) -> bool {
+    let mut changed = false;
+    ComboBox::from_id_source(id_source)
+        .selected_text(choice.display_label())
+        .show_ui(ui, |ui| {
+            ui.set_enabled(enabled);
+            for &bundled in sounds::bundled_sounds() {
+                let is_selected = matches!(choice, SoundChoice::Bundled(b) if *b == bundled);
+                if ui
+                    .selectable_label(is_selected, bundled.tag())
+                    .clicked()
+                {
+                    *choice = SoundChoice::Bundled(bundled);
+                    changed = true;
+                }
+            }
+
+            ui.separator();
+            let custom_selected = matches!(choice, SoundChoice::Custom(_));
+            if ui
+                .selectable_label(custom_selected, "Custom file...")
+                .clicked()
+            {
+                let starting_dir = if let SoundChoice::Custom(p) = choice {
+                    p.parent().map(|p| p.to_path_buf())
+                } else {
+                    None
+                };
+                if let Some(path) = sounds::pick_custom_sound_file(starting_dir.as_deref()) {
+                    *choice = SoundChoice::Custom(path);
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 impl MyApp {
@@ -442,6 +486,153 @@ impl MyApp {
         }
 
         ui.label(self.session_controller.broker_status_label());
+    }
+
+    fn render_rewards_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Rewards")
+            .id_source("rewards_section")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.render_kill_reward_block(ui);
+                ui.separator();
+                self.render_round_end_reward_block(ui);
+            });
+    }
+
+    fn render_kill_reward_block(&mut self, ui: &mut egui::Ui) {
+        ui.label("Instant reward on every kill");
+
+        let enabled_changed = ui
+            .add(egui::Checkbox::new(
+                &mut self.changes.rewards.kill_reward_enabled,
+                "Play sound on each kill",
+            ))
+            .changed();
+        if enabled_changed {
+            self.auto_save.request_immediate_save();
+        }
+
+        let enabled = self.changes.rewards.kill_reward_enabled;
+        ui.horizontal(|ui| {
+            ui.set_enabled(enabled);
+            ui.label("Sound: ");
+            if sound_picker(
+                ui,
+                "kill_reward_sound_picker",
+                &mut self.changes.rewards.kill_reward_sound,
+                enabled,
+            ) {
+                self.auto_save.request_immediate_save();
+            }
+            if ui.button("Preview").clicked() {
+                sounds::play(
+                    self.changes.rewards.kill_reward_sound.clone(),
+                    self.changes.rewards.kill_reward_volume_percent,
+                );
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let label = ui.label("Volume: ");
+            let response = ui.add_enabled(
+                enabled,
+                DragValue::new(&mut self.changes.rewards.kill_reward_volume_percent)
+                    .speed(1)
+                    .clamp_range(0..=VOLUME_PERCENT_MAX)
+                    .suffix("%"),
+            );
+            let changed = response.changed();
+            response.labelled_by(label.id);
+            if changed {
+                self.auto_save.request_debounced_save();
+            }
+        });
+    }
+
+    fn render_round_end_reward_block(&mut self, ui: &mut egui::Ui) {
+        ui.label("End-of-round reward when kill threshold is met");
+
+        let enabled_changed = ui
+            .add(egui::Checkbox::new(
+                &mut self.changes.rewards.round_end_reward_enabled,
+                "Play sound at round end if threshold is met",
+            ))
+            .changed();
+        if enabled_changed {
+            self.auto_save.request_immediate_save();
+        }
+
+        let enabled = self.changes.rewards.round_end_reward_enabled;
+
+        ui.horizontal(|ui| {
+            let label = ui.label("Kill threshold: ");
+            let response = ui.add_enabled(
+                enabled,
+                DragValue::new(&mut self.changes.rewards.round_end_reward_kill_threshold)
+                    .speed(1)
+                    .clamp_range(MIN_REWARD_KILL_THRESHOLD..=MAX_REWARD_KILL_THRESHOLD)
+                    .suffix(" kills"),
+            );
+            let changed = response.changed();
+            response.labelled_by(label.id);
+            if changed {
+                self.auto_save.request_debounced_save();
+            }
+        });
+
+        ui.label("Trigger:");
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.vertical_centered_justified(|ui| {
+                let always = ui.selectable_value(
+                    &mut self.changes.rewards.round_end_reward_gating,
+                    RoundEndRewardGating::Always,
+                    "Always when threshold met",
+                );
+                let win_only = ui.selectable_value(
+                    &mut self.changes.rewards.round_end_reward_gating,
+                    RoundEndRewardGating::OnlyIfTeamWins,
+                    "Only if team wins",
+                );
+                if always.changed() || win_only.changed() {
+                    self.auto_save.request_immediate_save();
+                }
+            });
+        });
+
+        ui.horizontal(|ui| {
+            ui.set_enabled(enabled);
+            ui.label("Sound: ");
+            if sound_picker(
+                ui,
+                "round_end_reward_sound_picker",
+                &mut self.changes.rewards.round_end_reward_sound,
+                enabled,
+            ) {
+                self.auto_save.request_immediate_save();
+            }
+            if ui.button("Preview").clicked() {
+                sounds::play(
+                    self.changes.rewards.round_end_reward_sound.clone(),
+                    self.changes.rewards.round_end_reward_volume_percent,
+                );
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let label = ui.label("Volume: ");
+            let response = ui.add_enabled(
+                enabled,
+                DragValue::new(&mut self.changes.rewards.round_end_reward_volume_percent)
+                    .speed(1)
+                    .clamp_range(0..=VOLUME_PERCENT_MAX)
+                    .suffix("%"),
+            );
+            let changed = response.changed();
+            response.labelled_by(label.id);
+            if changed {
+                self.auto_save.request_debounced_save();
+            }
+        });
     }
 
     fn render_setup_banner(&mut self, ui: &mut egui::Ui, summary: &SetupSummary) {
@@ -781,6 +972,12 @@ impl eframe::App for MyApp {
                     self.auto_save.request_debounced_save();
                 }
             });
+            ui.vertical_centered(|ui| {
+                ui.separator();
+            });
+
+            self.render_rewards_section(ui);
+
             ui.vertical_centered(|ui| {
                 ui.separator();
             });

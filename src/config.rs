@@ -3,9 +3,13 @@ use std::{fs::OpenOptions, io::Write};
 use log::error;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::sounds::{BundledSound, SoundChoice, VOLUME_PERCENT_MAX};
+
 pub const CONFIG_FILE_PATH: &str = "cs2shock-config.json";
 pub const MIN_SHOCK_DURATION: f32 = 0.1;
 pub const MAX_SHOCK_DURATION: f32 = 5.0;
+pub const MIN_REWARD_KILL_THRESHOLD: i32 = 1;
+pub const MAX_REWARD_KILL_THRESHOLD: i32 = 5;
 const SHOCK_DURATION_STEP: f32 = 0.1;
 const SHOCK_DURATION_EPSILON: f32 = 0.000_1;
 
@@ -43,6 +47,74 @@ where
     })
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoundEndRewardGating {
+    #[default]
+    Always,
+    OnlyIfTeamWins,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct RewardConfig {
+    pub kill_reward_enabled: bool,
+    pub kill_reward_sound: SoundChoice,
+    pub kill_reward_volume_percent: u32,
+
+    pub round_end_reward_enabled: bool,
+    pub round_end_reward_kill_threshold: i32,
+    pub round_end_reward_gating: RoundEndRewardGating,
+    pub round_end_reward_sound: SoundChoice,
+    pub round_end_reward_volume_percent: u32,
+}
+
+impl RewardConfig {
+    pub fn is_valid(&self) -> bool {
+        if self.kill_reward_volume_percent > VOLUME_PERCENT_MAX {
+            error!(
+                target: "Config",
+                "kill_reward_volume_percent must be between 0 and {VOLUME_PERCENT_MAX}"
+            );
+            return false;
+        }
+
+        if self.round_end_reward_volume_percent > VOLUME_PERCENT_MAX {
+            error!(
+                target: "Config",
+                "round_end_reward_volume_percent must be between 0 and {VOLUME_PERCENT_MAX}"
+            );
+            return false;
+        }
+
+        if !(MIN_REWARD_KILL_THRESHOLD..=MAX_REWARD_KILL_THRESHOLD)
+            .contains(&self.round_end_reward_kill_threshold)
+        {
+            error!(
+                target: "Config",
+                "round_end_reward_kill_threshold must be between {MIN_REWARD_KILL_THRESHOLD} and {MAX_REWARD_KILL_THRESHOLD}"
+            );
+            return false;
+        }
+
+        true
+    }
+}
+
+impl Default for RewardConfig {
+    fn default() -> Self {
+        Self {
+            kill_reward_enabled: true,
+            kill_reward_sound: SoundChoice::Bundled(BundledSound::Clicker),
+            kill_reward_volume_percent: 100,
+            round_end_reward_enabled: true,
+            round_end_reward_kill_threshold: 3,
+            round_end_reward_gating: RoundEndRewardGating::Always,
+            round_end_reward_sound: SoundChoice::Bundled(BundledSound::GoodPuppy1),
+            round_end_reward_volume_percent: 100,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -72,6 +144,7 @@ pub struct Config {
     pub selected_shocker_name: String,
     pub apikey: String,
     pub setup_dismissed: bool,
+    pub rewards: RewardConfig,
 }
 
 impl Default for Config {
@@ -97,6 +170,7 @@ impl Default for Config {
             selected_shocker_name: String::new(),
             apikey: String::new(),
             setup_dismissed: false,
+            rewards: RewardConfig::default(),
         }
     }
 }
@@ -161,6 +235,10 @@ impl Config {
             return false;
         }
 
+        if !self.rewards.is_valid() {
+            return false;
+        }
+
         return true;
     }
 
@@ -184,7 +262,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ShockTimingMode};
+    use super::{Config, RewardConfig, RoundEndRewardGating, ShockTimingMode};
+    use crate::sounds::{BundledSound, SoundChoice};
 
     #[test]
     fn default_config_matches_application_defaults() {
@@ -326,5 +405,89 @@ mod tests {
         config.round_kills_to_prevent_shock = 6;
 
         assert!(!config.validate());
+    }
+
+    #[test]
+    fn default_rewards_match_application_defaults() {
+        let rewards = RewardConfig::default();
+
+        assert!(rewards.kill_reward_enabled);
+        assert_eq!(
+            rewards.kill_reward_sound,
+            SoundChoice::Bundled(BundledSound::Clicker)
+        );
+        assert_eq!(rewards.kill_reward_volume_percent, 100);
+        assert!(rewards.round_end_reward_enabled);
+        assert_eq!(rewards.round_end_reward_kill_threshold, 3);
+        assert_eq!(
+            rewards.round_end_reward_gating,
+            RoundEndRewardGating::Always
+        );
+        assert_eq!(
+            rewards.round_end_reward_sound,
+            SoundChoice::Bundled(BundledSound::GoodPuppy1)
+        );
+        assert_eq!(rewards.round_end_reward_volume_percent, 100);
+    }
+
+    #[test]
+    fn validate_rejects_kill_volume_above_two_hundred() {
+        let mut config = Config::default();
+        config.rewards.kill_reward_volume_percent = 201;
+
+        assert!(!config.validate());
+    }
+
+    #[test]
+    fn validate_rejects_round_end_volume_above_two_hundred() {
+        let mut config = Config::default();
+        config.rewards.round_end_reward_volume_percent = 500;
+
+        assert!(!config.validate());
+    }
+
+    #[test]
+    fn validate_rejects_round_end_threshold_below_one() {
+        let mut config = Config::default();
+        config.rewards.round_end_reward_kill_threshold = 0;
+
+        assert!(!config.validate());
+    }
+
+    #[test]
+    fn validate_rejects_round_end_threshold_above_five() {
+        let mut config = Config::default();
+        config.rewards.round_end_reward_kill_threshold = 6;
+
+        assert!(!config.validate());
+    }
+
+    #[test]
+    fn deserialize_missing_rewards_field_uses_default() {
+        let json = serde_json::json!({
+            "username": "player",
+            "apikey": "key"
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert_eq!(config.rewards, RewardConfig::default());
+    }
+
+    #[test]
+    fn deserialize_partial_rewards_fills_missing_fields_from_default() {
+        let json = serde_json::json!({
+            "rewards": {
+                "kill_reward_volume_percent": 175
+            }
+        });
+
+        let config: Config = serde_json::from_value(json).unwrap();
+
+        assert_eq!(config.rewards.kill_reward_volume_percent, 175);
+        assert_eq!(
+            config.rewards.kill_reward_sound,
+            SoundChoice::Bundled(BundledSound::Clicker)
+        );
     }
 }

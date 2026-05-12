@@ -5,6 +5,7 @@ mod gui;
 mod pishock;
 mod pishock_session_controller;
 mod setup;
+mod sounds;
 
 use std::{
     fs::File,
@@ -12,10 +13,11 @@ use std::{
     sync::Arc,
 };
 
-use config::{Config, ShockTimingMode, CONFIG_FILE_PATH};
+use config::{Config, RoundEndRewardGating, ShockTimingMode, CONFIG_FILE_PATH};
 use gamestateintegration::{MapPhase, RoundPhase};
 use log::{error, info};
 use simple_logger::SimpleLogger;
+use sounds::SoundChoice;
 use time::macros::format_description;
 use tokio::sync::{Mutex, RwLock};
 
@@ -37,6 +39,8 @@ struct GameState {
     triggered_this_round: bool,
     shocks_disabled_until_next_round: bool,
     pending_round_end_shock: Option<PendingShock>,
+    current_round_kills: i32,
+    pending_round_end_reward: Option<PendingRoundEndReward>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,13 @@ struct PendingShock {
     timing_mode: ShockTimingMode,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PendingRoundEndReward {
+    sound: SoundChoice,
+    volume_percent: u32,
+    gating: RoundEndRewardGating,
+}
+
 impl Default for GameState {
     fn default() -> Self {
         Self {
@@ -64,6 +75,8 @@ impl Default for GameState {
             triggered_this_round: false,
             shocks_disabled_until_next_round: false,
             pending_round_end_shock: None,
+            current_round_kills: 0,
+            pending_round_end_reward: None,
         }
     }
 }
@@ -77,6 +90,8 @@ impl GameState {
         self.triggered_this_round = false;
         self.shocks_disabled_until_next_round = false;
         self.pending_round_end_shock = None;
+        self.current_round_kills = 0;
+        self.pending_round_end_reward = None;
     }
 }
 

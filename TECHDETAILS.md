@@ -46,8 +46,25 @@ The app automatically saves your settings to `cs2shock-config.json` in the curre
 - `selected_device_name`: the selected PiShock device name
 - `selected_shocker_name`: the selected PiShock shocker name
 - `setup_dismissed`: boolean, whether the first-run setup modal was dismissed
+- `rewards`: nested object controlling sound rewards. See [Reward Config](#reward-config-rewards) below.
 
-Older config files that still use `shock_on_round_loss_only` are accepted for backward compatibility and map to the equivalent timing mode automatically.
+Older config files that still use `shock_on_round_loss_only` are accepted for backward compatibility and map to the equivalent timing mode automatically. Older configs that omit `rewards` entirely are accepted and fall back to the documented defaults.
+
+### Reward Config (`rewards`)
+
+- `kill_reward_enabled`: boolean, whether to play a sound on every in-round kill (default `true`)
+- `kill_reward_sound`: tagged sound choice for the instant kill reward (default `{"kind": "bundled", "value": "clicker"}`)
+- `kill_reward_volume_percent`: integer `0` to `200`, playback volume for the kill reward (default `100`)
+- `round_end_reward_enabled`: boolean, whether to play a sound at round end when the kill threshold is met (default `true`)
+- `round_end_reward_kill_threshold`: integer `1` to `5`, in-round kills required to trigger the round-end reward (default `3`)
+- `round_end_reward_gating`: `"Always"` or `"OnlyIfTeamWins"`, controls whether the round-end reward fires regardless of outcome or only on a round win (default `"Always"`)
+- `round_end_reward_sound`: tagged sound choice for the round-end reward (default `{"kind": "bundled", "value": "goodpuppy1"}`)
+- `round_end_reward_volume_percent`: integer `0` to `200`, playback volume for the round-end reward (default `100`)
+
+Sound choices are tagged JSON objects:
+
+- Bundled assets: `{"kind": "bundled", "value": "<tag>"}` where `<tag>` is one of `clicker`, `goodpuppy1`, `goodpuppy2`, `goodpuppy3`, `goodpuppy4`, `goodboy1`, `goodgirl1`. These WAV files are embedded in `cs2shock.exe` at compile time, so the app does not need an `assets/` folder at runtime.
+- Custom files: `{"kind": "custom", "value": "<absolute path to .wav/.mp3/.ogg/.flac>"}`. Missing files are logged and silently skipped at playback time.
 
 ## Official Release Builds
 

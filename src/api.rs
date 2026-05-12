@@ -7,11 +7,11 @@ use rand::{thread_rng, Rng};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    config::{self, shock_duration_to_tenths, Config, ShockTimingMode},
+    config::{self, shock_duration_to_tenths, Config, RewardConfig, RoundEndRewardGating, ShockTimingMode},
     gamestateintegration::{MapPhase, Payload, RoundPhase},
-    pishock,
+    pishock, sounds,
     setup::EXPECTED_GSI_URI,
-    AppState, GameState, PendingShock, PlayerState,
+    AppState, GameState, PendingRoundEndReward, PendingShock, PlayerState,
 };
 
 pub async fn run(config: Arc<RwLock<Config>>) {
@@ -89,6 +89,36 @@ fn should_trigger_death_sequence(
 fn should_prevent_shock_for_round_kills(config: &Config, round_kills: i32) -> bool {
     config.prevent_shock_if_round_kills_reached
         && round_kills >= config.round_kills_to_prevent_shock
+}
+
+fn should_trigger_kill_reward(
+    rewards: &RewardConfig,
+    previous_kills: i32,
+    current_kills: i32,
+    map_phase: &MapPhase,
+    round_phase: &RoundPhase,
+) -> bool {
+    rewards.kill_reward_enabled
+        && current_kills > previous_kills
+        && *map_phase == MapPhase::Live
+        && *round_phase == RoundPhase::Live
+}
+
+fn arm_round_end_reward_if_eligible(
+    rewards: &RewardConfig,
+    round_kills: i32,
+) -> Option<PendingRoundEndReward> {
+    if !rewards.round_end_reward_enabled {
+        return None;
+    }
+    if round_kills < rewards.round_end_reward_kill_threshold {
+        return None;
+    }
+    Some(PendingRoundEndReward {
+        sound: rewards.round_end_reward_sound.clone(),
+        volume_percent: rewards.round_end_reward_volume_percent,
+        gating: rewards.round_end_reward_gating,
+    })
 }
 
 fn resolve_death_shock(
@@ -222,6 +252,30 @@ fn resolve_deferred_round_end_shock(
     }
 }
 
+fn resolve_pending_round_end_reward(
+    game_state: &mut GameState,
+    round_winner: Option<&str>,
+) -> Option<(crate::sounds::SoundChoice, u32)> {
+    let pending = game_state.pending_round_end_reward.as_ref()?;
+    let outcome = round_outcome_for_player(game_state.player_team.as_deref(), round_winner);
+
+    match (pending.gating, outcome) {
+        (RoundEndRewardGating::Always, _) => {
+            let reward = game_state.pending_round_end_reward.take()?;
+            Some((reward.sound, reward.volume_percent))
+        }
+        (RoundEndRewardGating::OnlyIfTeamWins, RoundOutcome::Won) => {
+            let reward = game_state.pending_round_end_reward.take()?;
+            Some((reward.sound, reward.volume_percent))
+        }
+        (RoundEndRewardGating::OnlyIfTeamWins, RoundOutcome::Lost) => {
+            game_state.pending_round_end_reward.take();
+            None
+        }
+        (RoundEndRewardGating::OnlyIfTeamWins, RoundOutcome::Unknown) => None,
+    }
+}
+
 async fn send_shock_sequence(config_handle: Arc<RwLock<Config>>, severity: i32) {
     let warning_config = config_handle.read().await.clone();
     if let Some(delay) = warning_beep_delay(&warning_config) {
@@ -269,6 +323,8 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
     let mut should_beep_on_match_start = false;
     let mut should_beep_on_round_start = false;
     let mut pending_shock = None;
+    let mut pending_kill_reward: Option<(crate::sounds::SoundChoice, u32)> = None;
+    let mut pending_reward_to_play: Option<(crate::sounds::SoundChoice, u32)> = None;
 
     if map_phase_changed
         || round_phase_changed
@@ -334,19 +390,45 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
             pending_shock = Some(severity);
         }
 
+        if game_state.round_phase == RoundPhase::Live && round.phase == RoundPhase::Over {
+            if let Some(reward) =
+                arm_round_end_reward_if_eligible(&config.rewards, game_state.current_round_kills)
+            {
+                info!(
+                    "Round ended with {} kill(s); arming round-end reward",
+                    game_state.current_round_kills
+                );
+                game_state.pending_round_end_reward = Some(reward);
+            }
+        }
+
+        if let Some(reward) =
+            resolve_pending_round_end_reward(&mut game_state, round.win_team.as_deref())
+        {
+            pending_reward_to_play = Some(reward);
+        }
+
         if game_state.round_phase != round.phase && round.phase == RoundPhase::Freezetime {
             game_state.triggered_this_round = false;
             game_state.shocks_disabled_until_next_round = false;
+            game_state.current_round_kills = 0;
             if game_state.pending_round_end_shock.take().is_some() {
                 debug!("Cleared deferred round-end shock at freezetime");
+            }
+            if game_state.pending_round_end_reward.take().is_some() {
+                debug!("Cleared deferred round-end reward at freezetime");
             }
         }
 
         if game_state.round_phase == RoundPhase::Freezetime && round.phase == RoundPhase::Live {
             game_state.triggered_this_round = false;
             game_state.shocks_disabled_until_next_round = false;
+            game_state.current_round_kills = 0;
             if game_state.pending_round_end_shock.take().is_some() {
                 debug!("Cleared deferred round-end shock at round start");
+            }
+            if game_state.pending_round_end_reward.take().is_some() {
+                debug!("Cleared deferred round-end reward at round start");
             }
 
             if config.beep_on_round_start {
@@ -362,6 +444,7 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
         if let Some(player) = payload.player {
             if player.steamid == game_state.steam_id {
                 game_state.player_team = player.team.clone();
+                game_state.current_round_kills = player.state.round_kills;
                 let already_triggered_this_round = game_state.triggered_this_round;
                 let shocks_disabled_until_next_round = game_state.shocks_disabled_until_next_round;
                 let round_phase = if previous_round_phase == RoundPhase::Live
@@ -372,9 +455,27 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
                     game_state.round_phase.clone()
                 };
 
+                let map_phase_now = game_state.map_phase.clone();
                 if let Some(player_state) = &mut game_state.player_state {
                     let mut should_mark_triggered_this_round = false;
                     let mut deferred_round_end_shock = None;
+
+                    if should_trigger_kill_reward(
+                        &config.rewards,
+                        player_state.kills,
+                        player.match_stats.kills,
+                        &map_phase_now,
+                        &round_phase,
+                    ) {
+                        info!(
+                            "Player got a kill ({}), playing kill reward",
+                            player.match_stats.kills
+                        );
+                        pending_kill_reward = Some((
+                            config.rewards.kill_reward_sound.clone(),
+                            config.rewards.kill_reward_volume_percent,
+                        ));
+                    }
 
                     if player_state.health > player.state.health && player.state.health > 0 {
                         // Took damage and survived
@@ -473,6 +574,14 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
         pishock::beep(state.config.clone(), 1).await;
     }
 
+    if let Some((sound, volume)) = pending_kill_reward {
+        sounds::play(sound, volume);
+    }
+
+    if let Some((sound, volume)) = pending_reward_to_play {
+        sounds::play(sound, volume);
+    }
+
     if let Some(severity) = pending_shock {
         send_shock_sequence(state.config.clone(), severity).await;
     }
@@ -483,16 +592,18 @@ async fn read_data(State(state): State<AppState>, Json(payload): Json<Payload>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        calculate_shock_severity, did_player_win_round, resolve_death_shock,
-        resolve_deferred_round_end_shock, resolve_shock_values, round_outcome_for_player,
-        scale_severity_value, should_prevent_shock_for_round_kills, should_send_shock,
-        should_send_shock_after_roll, should_trigger_death_sequence, warning_beep_delay,
+        arm_round_end_reward_if_eligible, calculate_shock_severity, did_player_win_round,
+        resolve_death_shock, resolve_deferred_round_end_shock, resolve_pending_round_end_reward,
+        resolve_shock_values, round_outcome_for_player, scale_severity_value,
+        should_prevent_shock_for_round_kills, should_send_shock, should_send_shock_after_roll,
+        should_trigger_death_sequence, should_trigger_kill_reward, warning_beep_delay,
         RoundOutcome,
     };
-    use crate::gamestateintegration::RoundPhase;
+    use crate::gamestateintegration::{MapPhase, RoundPhase};
+    use crate::sounds::{BundledSound, SoundChoice};
     use crate::{
-        config::{Config, ShockMode, ShockTimingMode},
-        GameState, PendingShock,
+        config::{Config, RewardConfig, RoundEndRewardGating, ShockMode, ShockTimingMode},
+        GameState, PendingRoundEndReward, PendingShock,
     };
     use std::time::Duration;
 
@@ -845,5 +956,162 @@ mod tests {
             resolve_shock_values(&config, pending_shock.severity),
             (10, 300)
         );
+    }
+
+    #[test]
+    fn should_trigger_kill_reward_fires_on_positive_kill_delta_during_live_round() {
+        let rewards = RewardConfig::default();
+        assert!(should_trigger_kill_reward(
+            &rewards,
+            2,
+            3,
+            &MapPhase::Live,
+            &RoundPhase::Live
+        ));
+    }
+
+    #[test]
+    fn should_trigger_kill_reward_ignores_zero_or_negative_delta() {
+        let rewards = RewardConfig::default();
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            3,
+            3,
+            &MapPhase::Live,
+            &RoundPhase::Live
+        ));
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            3,
+            2,
+            &MapPhase::Live,
+            &RoundPhase::Live
+        ));
+    }
+
+    #[test]
+    fn should_trigger_kill_reward_suppressed_outside_live_phase() {
+        let rewards = RewardConfig::default();
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            0,
+            1,
+            &MapPhase::Warmup,
+            &RoundPhase::Live
+        ));
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            0,
+            1,
+            &MapPhase::Live,
+            &RoundPhase::Freezetime
+        ));
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            0,
+            1,
+            &MapPhase::Live,
+            &RoundPhase::Over
+        ));
+    }
+
+    #[test]
+    fn should_trigger_kill_reward_respects_disabled_setting() {
+        let mut rewards = RewardConfig::default();
+        rewards.kill_reward_enabled = false;
+        assert!(!should_trigger_kill_reward(
+            &rewards,
+            0,
+            1,
+            &MapPhase::Live,
+            &RoundPhase::Live
+        ));
+    }
+
+    #[test]
+    fn arm_round_end_reward_returns_pending_when_threshold_met() {
+        let rewards = RewardConfig::default();
+        let pending = arm_round_end_reward_if_eligible(&rewards, 3).expect("should arm");
+        assert_eq!(pending.sound, rewards.round_end_reward_sound);
+        assert_eq!(pending.volume_percent, rewards.round_end_reward_volume_percent);
+        assert_eq!(pending.gating, rewards.round_end_reward_gating);
+    }
+
+    #[test]
+    fn arm_round_end_reward_returns_none_below_threshold() {
+        let rewards = RewardConfig::default();
+        assert!(arm_round_end_reward_if_eligible(&rewards, 2).is_none());
+    }
+
+    #[test]
+    fn arm_round_end_reward_returns_none_when_disabled() {
+        let mut rewards = RewardConfig::default();
+        rewards.round_end_reward_enabled = false;
+        assert!(arm_round_end_reward_if_eligible(&rewards, 5).is_none());
+    }
+
+    fn pending_reward(gating: RoundEndRewardGating) -> PendingRoundEndReward {
+        PendingRoundEndReward {
+            sound: SoundChoice::Bundled(BundledSound::GoodPuppy1),
+            volume_percent: 100,
+            gating,
+        }
+    }
+
+    #[test]
+    fn resolve_pending_round_end_reward_fires_unconditionally_when_gating_is_always() {
+        for winner in [Some("CT"), Some("T"), None] {
+            let mut game_state = GameState::default();
+            game_state.player_team = Some("CT".into());
+            game_state.pending_round_end_reward = Some(pending_reward(RoundEndRewardGating::Always));
+
+            let result = resolve_pending_round_end_reward(&mut game_state, winner);
+
+            assert!(result.is_some(), "winner={:?} should fire reward", winner);
+            assert!(game_state.pending_round_end_reward.is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_pending_round_end_reward_fires_only_on_win_for_only_if_team_wins() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("CT".into());
+        game_state.pending_round_end_reward =
+            Some(pending_reward(RoundEndRewardGating::OnlyIfTeamWins));
+
+        let result = resolve_pending_round_end_reward(&mut game_state, Some("CT"));
+        assert!(result.is_some());
+        assert!(game_state.pending_round_end_reward.is_none());
+    }
+
+    #[test]
+    fn resolve_pending_round_end_reward_clears_silently_on_loss_for_only_if_team_wins() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("T".into());
+        game_state.pending_round_end_reward =
+            Some(pending_reward(RoundEndRewardGating::OnlyIfTeamWins));
+
+        let result = resolve_pending_round_end_reward(&mut game_state, Some("CT"));
+        assert!(result.is_none());
+        assert!(game_state.pending_round_end_reward.is_none());
+    }
+
+    #[test]
+    fn resolve_pending_round_end_reward_keeps_pending_when_winner_unknown() {
+        let mut game_state = GameState::default();
+        game_state.player_team = Some("CT".into());
+        game_state.pending_round_end_reward =
+            Some(pending_reward(RoundEndRewardGating::OnlyIfTeamWins));
+
+        let result = resolve_pending_round_end_reward(&mut game_state, None);
+        assert!(result.is_none());
+        assert!(game_state.pending_round_end_reward.is_some());
+    }
+
+    #[test]
+    fn resolve_pending_round_end_reward_returns_none_when_nothing_pending() {
+        let mut game_state = GameState::default();
+        let result = resolve_pending_round_end_reward(&mut game_state, Some("CT"));
+        assert!(result.is_none());
     }
 }

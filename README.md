@@ -1,6 +1,6 @@
 # CS2Shock
 
-Bring real stakes to your CS2 matches! **CS2Shock** is a small app that connects Counter-Strike 2 to your PiShock, delivering a shock when you die in a live match!
+Bring real stakes to your CS2 matches! **CS2Shock** is a small app that connects Counter-Strike 2 to your PiShock, delivering a shock when you die in a live match. It also rewards you with a sound effect on every kill, so you can pair positive reinforcement with the punishment side of the loop.
 
 ## What You Need
 
@@ -28,6 +28,17 @@ CS2Shock comes with several fun modes and modifiers to customize your punishment
 - **Shock Timing**: Choose whether to shock immediately on death, wait until the round ends, or wait until the round ends and only shock if your team loses.
 - **Mercy Rule (Kill Threshold)**: Earn your immunity and save yourself! If you get enough kills in a round (configurable), you won't be shocked if you die later in that same round.
 
+### Sound Rewards
+Pair the punishment side with positive reinforcement. CS2Shock can play a sound effect on every kill (clicker-style) and a separate "good job" sound at the end of a round when you hit a kill threshold. Both rewards are independent of the PiShock and only need a working audio output.
+
+- **Instant Kill Reward**: Plays a short sound the moment your match kill counter goes up while you're in a live round. Defaults to a quiet `clicker.wav` for clicker-training pairing.
+- **End-of-Round Reward**: At the end of a round, if your in-round kills met the configured threshold, plays a longer reward sound. Defaults to `goodpuppy1.wav`.
+- **Trigger Mode**: The end-of-round reward can fire **always** when the threshold is met, or **only if your team wins** the round.
+- **Volume**: Each reward has its own 0-200% volume slider in case the sound needs a boost over your game audio.
+- **Custom Sounds**: Pick the bundled defaults from the dropdown, or choose your own `.wav`, `.mp3`, `.ogg`, or `.flac` file. A "Preview" button next to each picker lets you audition the sound before saving.
+
+Rewards are gated to live rounds only, so warmup, freezetime, and intermission kills will not trigger them.
+
 ## Troubleshooting
 
 **Why am I not getting shocked?**
@@ -41,6 +52,11 @@ CS2Shock comes with several fun modes and modifiers to customize your punishment
 **Why is the app not reacting to gameplay at all?**
 - Make sure the CS2 integration was installed correctly (the app should say it's installed).
 - Ensure you are playing a **live match**. The app ignores deaths during warmup!
+
+**Why isn't my sound reward playing?**
+- Confirm the reward checkbox is enabled and use the "Preview" button next to the sound picker to verify your audio output works.
+- If you picked a custom file, make sure the file still exists at that path. Moving or renaming it after selection will silently fail playback (check the logs).
+- Rewards are suppressed outside of live rounds, so kills during warmup or freezetime will not trigger them.
 
 ## Advanced & Technical Details
 
