@@ -867,6 +867,9 @@ impl eframe::App for MyApp {
             let setup_summary = self.setup_summary();
             ui.heading("CS2 Shock");
 
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
             if setup_summary.needs_setup() && self.changes.setup_dismissed {
                 self.render_setup_banner(ui, &setup_summary);
                 ui.separator();
@@ -1085,6 +1088,7 @@ impl eframe::App for MyApp {
             ui.vertical_centered(|ui| {
                 ui.separator();
             });
+                });
 
             if self.auto_save.take_save_due() {
                 self.persist_changes_if_needed();
