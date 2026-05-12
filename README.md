@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/ostlerdev/cs2shock/blob/main/assets/icon.png?raw=true" width="128" height="128" alt="cs2shock App Icon"/>
+</p>
+
 # CS2Shock
 
 Bring real stakes to your CS2 matches! **CS2Shock** is a small app that connects Counter-Strike 2 to your PiShock, delivering a shock when you die in a live match. It also rewards you with a sound effect on every kill, so you can pair positive reinforcement with the punishment side of the loop.
@@ -9,10 +13,14 @@ Bring real stakes to your CS2 matches! **CS2Shock** is a small app that connects
 
 ## Quick Start Guide
 
-1. Download and launch `cs2shock.exe`.
+1. [Download and launch `cs2shock.exe`.](https://github.com/OstlerDev/cs2shock/releases/latest/)
 2. Follow the **Setup Guide** in the app.
 3. Adjust the settings to your liking.
 4. Jump into a live CS2 match and try not to die!
+
+<p align="center">
+  <img src="https://github.com/ostlerdev/cs2shock/blob/main/assets/app-example.png?raw=true"  width="312" height="610" alt="cs2shock App Example"/>
+</p>
 
 ## Customizing Your Experience
 
@@ -30,6 +38,10 @@ CS2Shock comes with several fun modes and modifiers to customize your punishment
 
 ### Sound Rewards
 Pair the punishment side with positive reinforcement. CS2Shock can play a sound effect on every kill (clicker-style) and a separate "good job" sound at the end of a round when you hit a kill threshold. Both rewards are independent of the PiShock and only need a working audio output.
+
+<p align="center">
+  <img src="https://github.com/ostlerdev/cs2shock/blob/main/assets/app-rewards-example.png?raw=true"  width="313" height="241" alt="cs2shock Rewards UI Example"/>
+</p>
 
 - **Instant Kill Reward**: Plays a short sound the moment your match kill counter goes up while you're in a live round. Defaults to a quiet `clicker.wav` for clicker-training pairing.
 - **End-of-Round Reward**: At the end of a round, if your in-round kills met the configured threshold, plays a longer reward sound. Defaults to `goodpuppy1.wav`.
